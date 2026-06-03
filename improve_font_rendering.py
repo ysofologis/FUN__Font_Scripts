@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Improve OTF/TTF font rendering using fonttools.
 
@@ -17,12 +16,10 @@ try:
     from fontTools.ttLib.tables._g_l_y_f import Glyph
     from fontTools.pens.ttGlyphPen import TTGlyphPen
     from fontTools.pens.transformPen import TransformPen
-    from fontTools.pens.ttGlyphPen import TTGlyphPen
-    from fontTools.misc.etree import fromlist
     from fontTools.ttLib.tables import otTables
-    from fontTools.hint.autohint import AHFont
-except ImportError:
-    print("ERROR: fonttools is required. Install with: pip install fonttools")
+except ImportError as x:
+    print(f"ERROR: fonttools is required. Install with: pip install fonttools")
+    print(f"       Import error: {x}")
     sys.exit(1)
 
 
