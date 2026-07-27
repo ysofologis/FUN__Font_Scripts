@@ -151,6 +151,105 @@ Both scripts:
 
 ---
 
+## OTF/TTF Font Optimizer (`otf_optimize-v11.py`)
+
+A separate script for **font scaling, widening/narrowing, and auto-hinting** using `ttfautohint` (TrueType) and `psautohint` (CFF/OTF).
+
+### Quick Start
+
+```bash
+# Install dependencies
+pip install fonttools ttfautohint psautohint
+
+# Scale up 7.5% and auto-hint
+python otf_optimize-v11.py --scale 7.5 input.otf output.otf
+
+# Widen by 20% (factor 1.2)
+python otf_optimize-v11.py --widen 1.2 input.otf output.otf
+
+# Narrow by 10% (factor 0.9)
+python otf_optimize-v11.py --widen 0.9 input.otf output.otf
+
+# Combine scaling + widening
+python otf_optimize-v11.py --scale 5 --widen 1.15 input.otf output.otf
+
+# Batch process directory
+python otf_optimize-v11.py --widen 1.1 input_fonts/ output_fonts/
+
+# CFF tuning with widening
+python otf_optimize-v11.py --widen 1.1 --allow-changes --no-flex in.otf out.otf
+
+# Just auto-hint (no scaling)
+python otf_optimize-v11.py input.otf output.otf
+
+# Check dependencies
+python otf_optimize-v11.py --check-deps
+```
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `--scale FLOAT` | **Uniform scale percentage** (positive = larger, negative = smaller). Default: 0 |
+| `--widen FLOAT` | **Horizontal scale factor** (<1.0 = narrow, >1.0 = widen, 1.0 = no change). Default: 1.0 |
+| `--strength INT` | `ttfautohint` hinting strength ceiling |
+| `--allow-changes` | `psautohint --allow-changes` (reorder paths) |
+| `--no-flex` | `psautohint --no-flex` (disable flex hints) |
+| `--no-hint-sub` | `psautohint --no-hint-sub` |
+| `--no-combining` | `ttfautohint --no-combining-chars` |
+| `--fallback-stem INT` | `ttfautohint --fallback-stem-width` |
+| `--detailed` | `ttfautohint --detailed-info` |
+| `-v, --verbose` | Debug logging |
+| `--check-deps` | Check `ttfautohint`/`psautohint` availability |
+
+### Version History
+
+| Version | Key Changes |
+|---------|-------------|
+| **v11** | **Added `--widen` parameter** for horizontal scaling (widen/narrow). TrueType: X-coordinate scaling. CFF: horizontal-only affine transform via `TransformPen`. Scales horizontal metrics (`hmtx`, `hhea`, `OS/2` horiz) only. Vertical metrics unchanged. |
+| **v10** | **Precision improvements**: CFF scaling via `TransformPen` + `T2CharStringPen` (no manual coordinate math). Single-pass rounding. CFF hint value scaling (`BlueValues`, `StemSnapH/V`, `BlueShift`, `BlueFuzz`, `FontBBox`). `head` table bbox + `lowestRecPPEM` scaling. Removed redundant `preserve_curves` flag. Composite glyph offset handling fixed. |
+| **v9** | Initial scaling support (`--scale`). TrueType + CFF auto-hinting. Directory batch processing. |
+
+### How It Works
+
+```
+Input font (.otf/.ttf)
+       │
+       ├─► [--scale] Uniform scaling (v10)
+       │       ├─ TrueType: scale all coords + composites
+       │       └─ CFF: TransformPen → T2CharStringPen → new CharStrings
+       │
+       ├─► [--widen] Horizontal scaling (v11)
+       │       ├─ TrueType: scale X coords only
+       │       └─ CFF: TransformPen(factor, 0, 0, 1, 0, 0)
+       │
+       ├─► Analyze format: glyf (TTF) vs CFF/CFF2 (OTF)
+       │
+       ├─► [ttfautohint] TrueType fonts
+       │       --default-script=latn --fallback-scaling --symbol
+       │
+       └─► [psautohint] CFF fonts
+               --no-zones-stems (re-hint from scaled outlines)
+```
+
+### Dependencies
+
+| Tool | Install |
+|------|---------|
+| `ttfautohint` | `pip install ttfautohint` (or system package) |
+| `psautohint` | `pip install psautohint` (part of AFDKO) |
+| `fonttools` | `pip install fonttools` |
+
+### Notes
+
+- **Order of operations**: `--scale` applied first, then `--widen` (commutative for final result)
+- **CFF hint scaling** (v10): `psautohint --no-zones-stems` re-hints from scaled outlines; CFF `Private` dict hints pre-scaled for correct alignment zones
+- **Composite glyphs**: Component offsets scaled; transform matrices (a,b,c,d) left unchanged
+- **Output format**: Preserves input format (OTF→OTF, TTF→TTF)
+- **Validation**: `--widen` factor must be > 0
+
+---
+
 ## Troubleshooting
 
 ### "No module named 'fontforge'"
