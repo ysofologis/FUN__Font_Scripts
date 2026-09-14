@@ -499,9 +499,18 @@ def _apply_solid_postprocess(font: TTFont, weight_offset: int) -> None:
 
     Args:
         font: Open TTFont object.
-        weight_offset: Amount to add to OS/2 usWeightClass.
+        weight_offset: Amount to add to OS/2 usWeightClass. Pass 0 to skip
+                       the weight class bump (recommended for most fonts).
+
+    Note (v8.3 update):
+      Bumping usWeightClass corrupts Fontconfig matching (e.g. 400 → 450
+      misidentifies the font as 'Medium' instead of 'Regular'). Default
+      is 0 to avoid this; pass --weight-offset N explicitly if needed.
     """
     is_cff = 'CFF ' in font or 'CFF2' in font
+
+    if weight_offset == 0:
+        return  # Skip weight class modifications (safer default)
 
     # --- 1. CFF weight hints (safe subset) ---
     # NOTE: ForceBold is intentionally NOT set because Chrome's Skia
@@ -515,7 +524,7 @@ def _apply_solid_postprocess(font: TTFont, weight_offset: int) -> None:
         logger.debug("CFF ForceBold omitted (Chrome incompat). "
                      "Using OS/2 weight class + macStyle bold bit instead.")
 
-    # --- 2. OS/2 weight class bump ---
+    # --- 2. OS/2 weight class bump (now opt-in) ---
     if 'OS/2' in font:
         os2 = font['OS/2']
         old_weight = os2.usWeightClass
@@ -928,18 +937,20 @@ For solid, concrete rendering (bolder, heavier):
     parser.add_argument(
         "--solid", action="store_true", dest="solid",
         help="[NEW] Enable SOLID, CONCRETE rendering mode. Activates: "
-             "(1) OS/2 usWeightClass bump (+50 by default), "
-             "(2) head macStyle bold bit (on weight >= 600), "
-             "(3) Aggressive GASP table (grid-fit prioritised), "
-             "(4) Hinting range expanded to 4-128ppem, "
-             "(5) All --clear-shaping enhancements included."
+             "(1) head macStyle bold bit (on weight >= 600), "
+             "(2) Aggressive GASP table (grid-fit prioritised), "
+             "(3) Hinting range expanded to 4-128ppem, "
+             "(4) All --clear-shaping enhancements included."
+             " (v8.3: no longer bumps usWeightClass by default — use --weight-offset N to opt in.)"
     )
 
     parser.add_argument(
         "--weight-offset", type=int, default=0, dest="weight_offset",
-        help="[NEW] Amount to add to OS/2 usWeightClass for a bolder "
-             "appearance (default with --solid: 50). Higher values = bolder. "
-             "Does not modify glyph outlines, only the font's weight metadata."
+        help="[v8.3 CHANGED] Add this N to OS/2 usWeightClass. Default 0 (no bump). "
+             "WARNING: bumping weight class can affect font matching. "
+             "Fontconfig maps weight classes (400=Regular, 700=Bold, etc.), "
+             "so bumping 400→450 changes how some apps identify the font. "
+             "Only use when you understand the impact."
     )
 
     # ---- v8.1: Clear shaping mode ----
@@ -1058,7 +1069,12 @@ For solid, concrete rendering (bolder, heavier):
     options = {
         # v8.1: Solid
         'solid': args.solid,
-        'weight_offset': args.weight_offset if args.weight_offset > 0 else (50 if args.solid else 0),
+                # v8.3: --weight-offset defaults to 0 (no automatic bump)
+        # Reason: bumping usWeightClass can corrupt Fontconfig matching
+        # (e.g. 400 → 450 = 'Medium' instead of 'Regular', causing Chrome
+        # to render text with wrong synthetic bold).
+        # Users who want it can pass --weight-offset N explicitly.
+        'weight_offset': args.weight_offset if args.weight_offset > 0 else 0,
 
         # v8.1: Clear-shaping
         'clear_shaping': args.clear_shaping or args.solid,  # solid implies clear_shaping
