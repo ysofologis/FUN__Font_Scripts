@@ -4,16 +4,15 @@ This directory contains Python scripts for improving OTF/TTF font rendering qual
 
 | Script | Focus |
 |--------|-------|
-| `otf_optimize_ff-v2.0.py` | **Latest (FontForge-based):** Single-tool dependency (FontForge), fontTools for post-processing |
-| `otf_optimize-v8.4.py` | **Latest (fontTools + psautohint):** Best CFF hint quality (uses external psautohint) |
-| `otf_optimize-v8.3.py` | Previous version with v8.3 inset-rescale --thickness (buggy) |
+| `otf_optimize_ff-v2.1.py` | **Latest (FontForge-based):** Single-tool dependency (FontForge), fontTools for post-processing. Has proper --thickness via FontForge changeWeight. |
+| `otf_optimize-v8.3.py` | **Latest (fontTools + psautohint):** Best CFF hint quality (uses external psautohint). Note: --thickness uses inset-rescale which has side effects; FontForge version recommended for thickening. |
 | `otf_optimize-v8.1.py` | Previous version (kept in sync for reference) |
 | `improve_font_rendering.py` | Light touch-ups, CFF fonts, cross-platform |
 | `improve_fontforge.py` | Aggressive cleanup, TrueType, complex shapes |
 
 ---
 
-## OTF/TTF Font Optimizer (`otf_optimize-v8.4.py`)
+## OTF/TTF Font Optimizer (`otf_optimize-v8.3.py`)
 
 The latest and recommended script for **font scaling, thickening, auto-hinting, hint tuning, and solid/concrete rendering** using `ttfautohint` (TrueType) and `psautohint` (CFF/OTF). Built entirely on fontTools.
 
@@ -24,22 +23,22 @@ The latest and recommended script for **font scaling, thickening, auto-hinting, 
 pip install fonttools ttfautohint psautohint
 
 # Proven command (recommended for Samsung & similar Korean fonts)
-python otf_optimize-v8.4.py --solid --hint-tune --rebuild-hints --thickness 2.5 --scale 5.0 input_fonts/ output_fonts/
+python otf_optimize-v8.3.py --solid --hint-tune --rebuild-hints --thickness 2.5 --scale 5.0 input_fonts/ output_fonts/
 
 # Basic optimisation
-python otf_optimize-v8.4.py input_fonts/ output_fonts/
+python otf_optimize-v8.3.py input_fonts/ output_fonts/
 
 # Just clear shaping (lighter touch)
-python otf_optimize-v8.4.py --clear-shaping input_fonts/ output_fonts/
+python otf_optimize-v8.3.py --clear-shaping input_fonts/ output_fonts/
 
 # Maximum boldness (use with caution - see weight-offset warning below)
-python otf_optimize-v8.4.py --solid --thickness 15 --weight-offset 80 input_fonts/ output_fonts/
+python otf_optimize-v8.3.py --solid --thickness 15 --weight-offset 80 input_fonts/ output_fonts/
 ```
 
 ### Your Proven Command
 
 ```bash
-python /storage/drive-S/Work/SideProjects/fonts/otf_optimize-v8.4.py \
+python /storage/drive-S/Work/SideProjects/fonts/otf_optimize-v8.3.py \
   --solid \
   --hint-tune \
   --rebuild-hints \
@@ -60,13 +59,13 @@ This command:
 - **Auto-hints** with psautohint (CFF) or ttfautohint (TrueType)
 - **Applies clear-shaping** post-processing (GASP table, head flags, etc.)
 
-### What's New in v8.4 (alongside v8.2/v8.3)
+### What's New in v8.3
 
-v8.4 fixes the v8.3 `--thickness` regression with a RADIAL DILATION approach:
+v8.3 fixes a fundamental misunderstanding of `--thickness`:
 
 | Feature | What it does | Impact |
 |---------|-------------|--------|
-| **`--thickness` v8.4 RADIAL DILATION** | v8.3 used inset-rescale on every contour which made the outer contour shrink too (glyph appeared smaller). v8.4 detects outer vs inner contours by SIGNED AREA (shoelace formula) and applies radial dilation from the GLYPH CENTER: OUTER contour pushed OUTWARD by dx units (glyph grows slightly); INNER counter pushed INWARD by dx units (counter shrinks, stems thicker on both sides). Net effect: stems visibly thicker, glyph slightly larger (similar to FontForge's `changeWeight`), advance widths preserved. | **Critical correctness fix** |
+| **`--thickness` REWORKED** | v8.3 thins stems via inset-rescale. v8.2 used non-uniform X scale (factor_x > factor_y) which made the entire font wider AND taller while also thickening stems. The v8.3 approach uses per-contour inset-rescale: each contour's left/bottom edge is preserved, inner counters shrink by `2*dx` horizontally, making stems appear thicker while keeping advance widths unchanged. (NOTE: v8.4 attempted radial dilation to fix the outer-shrink side-effect but it caused uneven curve thickening. v8.4 was removed; FontForge-based v2.1 is recommended for proper thickening.) | **Improvement (with caveat)** |
 | **`--hint-tune`** | CFF Private dict tuning: sets `LanguageGroup=1`, `ExpansionFactor`, `BlueShift/BlueFuzz`, and **synthesises `BlueValues`/`OtherBlues` from OS/2 metrics when the font has none**. Most Samsung-style fonts ship without alignment zones, so this is a massive improvement. | **Highest** |
 | **`--rebuild-hints`** | Rebuilds CFF `BlueValues`/`OtherBlues` from current OS/2 `sCapHeight`/`sxHeight` **even when they already exist**. Critical when scaling/thickening, since original BlueValues no longer match scaled outlines (causing hint drift). Applied BEFORE psautohint so hints are correctly aligned. | **High** |
 | **`--shape-cleanup`** | TrueType outline cleanup: removes collinear points (3+ on a line) and near-duplicate points (within 0.5 units). Cleaner curves, smoother rendering, smaller files. | Medium |
@@ -76,7 +75,7 @@ v8.4 fixes the v8.3 `--thickness` regression with a RADIAL DILATION approach:
 | **psautohint long-name auto-exclusion** | Auto-detects glyphs with names > 64 chars (Apple/Google emoji fonts) and excludes them from psautohint via `-x`. Prevents "Bad input data. Glyph name is greater than 64 chars" errors. | Critical for emoji fonts |
 | **hmtx auto-fill for long-named glyphs** | Ensures hmtx has entries for all glyphs so `fontTools.getGlyphSet()` doesn't fail on emoji fonts with very long glyph names. | Critical for emoji fonts |
 | **Head bit 3 cleared** | Explicitly clears `head.flags` bit 3 (Force PPEM integer) — Chrome/Skia rejects fonts with this flag. The previous `|=` didn't clear existing bits, so fonts with the flag set would still fail. | Chrome compat |
-| **`--scale` v8.4 dual mode** | Values in `[0, 1)` are direct multipliers (e.g. `0.8` = 80% size); values `>=1` are percentage changes (e.g. `5` = +5%). Intuitive "shrink to X%" support. Safety cap: [0.10, 4.00]. | UX |
+| **`--scale` dual mode** | Values in `[0, 1)` are direct multipliers (e.g. `0.8` = 80% size); values `>=1` are percentage changes (e.g. `5` = +5%). Intuitive "shrink to X%" support. Safety cap: [0.10, 4.00]. | UX |
 
 ### All Parameters
 
@@ -92,8 +91,8 @@ v8.4 fixes the v8.3 `--thickness` regression with a RADIAL DILATION approach:
 | `--dropout-control` | Add dropout control via PREP table (SCANMODE mode 2) for TrueType. Eliminates half-pixel dropouts. | off |
 | `--gasp-detail {aggressive,balanced,minimal}` | Granular GASP control (5 ranges, optimal AA per range). | aggressive |
 | `--no-stem-round` | Skip stem width rounding (`StdHW`/`StdVW`/`StemSnap`). Used with `--hint-tune`. | off |
-| `--scale FLOAT` | **[v8.4 dual mode]** Scale font size: `\|value\| < 1.0` → direct multiplier (e.g. `0.5` = ×0.50 / 50% size); `\|value\| >= 1.0` → percentage change (e.g. `5` = +5%). Safety cap [0.10, 4.00]. | 0 |
-| `--thickness FLOAT` | **[v8.4 RADIAL DILATION] Thicken stems by dilating each contour from the glyph center. Outer contour expands outward (glyph grows slightly), inner counter shrinks inward (counter smaller). Stems appear thicker on BOTH sides. Advance widths preserved. `2.5` = subtle bolder, `10` = clearly thicker. Recommended: 1-10. Works alongside `--scale`. | 0 |
+| `--scale FLOAT` | **[dual mode]** Scale font size: `\|value\| < 1.0` → direct multiplier (e.g. `0.5` = ×0.50 / 50% size); `\|value\| >= 1.0` → percentage change (e.g. `5` = +5%). Safety cap [0.10, 4.00]. | 0 |
+| `--thickness FLOAT` | **[inset-rescale] Thicken stems by dilating each contour from the glyph center. Outer contour expands outward (glyph grows slightly), inner counter shrinks inward (counter smaller). Stems appear thicker on BOTH sides. Advance widths preserved. `2.5` = subtle bolder, `10` = clearly thicker. Recommended: 1-10. Works alongside `--scale`. | 0 |
 | `--weight-offset INT` | **[v8.3 CHANGED]** Add this N to OS/2 `usWeightClass`. **Default 0 (no automatic bump)**. WARNING: bumping weight class can affect font matching (Fontconfig maps 400=Regular, 700=Bold). Only use when you understand the impact. Pass `--weight-offset 50` explicitly if needed. | 0 |
 | `--x-height-hint INT` | Percentage to increase x-height for better small-size legibility (e.g., 3 = 3% larger lowercase). Recommended: 2-5. | 0 |
 | `--hinting-range-min INT` | Minimum ppem for hinting generation. Lower = better tiny-size rendering. Default: 8 (standard), 6 (with `--clear-shaping`), 4 (with `--solid`). | auto |
@@ -113,22 +112,22 @@ v8.4 fixes the v8.3 `--thickness` regression with a RADIAL DILATION approach:
 
 ```bash
 # Proven command (recommended for Samsung-style fonts)
-python otf_optimize-v8.4.py --solid --hint-tune --thickness 2.5 --scale 5.0 ./input/ ./output/
+python otf_optimize-v8.3.py --solid --hint-tune --thickness 2.5 --scale 5.0 ./input/ ./output/
 
 # Clear shaping only (no boldness, lighter touch)
-python otf_optimize-v8.4.py --clear-shaping ./input/ ./output/
+python otf_optimize-v8.3.py --clear-shaping ./input/ ./output/
 
 # Heavy bold with full v8.2 pipeline
-python otf_optimize-v8.4.py --solid --hint-tune --shape-cleanup --thickness 15 --weight-offset 80 ./input/ ./output/
+python otf_optimize-v8.3.py --solid --hint-tune --shape-cleanup --thickness 15 --weight-offset 80 ./input/ ./output/
 
 # Just hint tuning (for fonts with no BlueValues, like Samsung)
-python otf_optimize-v8.4.py --hint-tune ./input/ ./output/
+python otf_optimize-v8.3.py --hint-tune ./input/ ./output/
 
 # Custom GASP granularity
-python otf_optimize-v8.4.py --solid --hint-tune --gasp-detail minimal ./input/ ./output/
+python otf_optimize-v8.3.py --solid --hint-tune --gasp-detail minimal ./input/ ./output/
 
 # Scale up 10% with hint tuning
-python otf_optimize-v8.4.py --clear-shaping --hint-tune --scale 10 ./input/ ./output/
+python otf_optimize-v8.3.py --clear-shaping --hint-tune --scale 10 ./input/ ./output/
 ```
 
 ### How It Works
@@ -189,13 +188,13 @@ All Chrome-breaking issues have been fixed:
 
 | Version | Key Changes |
 |---------|-------------|
-| **v8.4** | **Latest.** `--thickness` upgraded to RADIAL DILATION: each contour dilated from glyph center. Outer contour expands outward (glyph grows slightly), inner counter shrinks inward. Stems thicker on both sides, advance widths preserved. Similar to FontForge's `changeWeight`. Verified on 'O': stem grew by 31 units (160 → 191), glyph grew ~5% wider, advance preserved. |
-| **v8.3** | `--thickness` reworked: per-contour inset-rescale (outer contour left/bottom preserved, inner counter shrunk → stems thicker, advance widths unchanged). Had a quirk that also shrank the outer contour, making glyphs look smaller. Superseded by v8.4. |
+| **v8.3** | `--thickness` reworked: per-contour inset-rescale (outer contour left/bottom preserved, inner counter shrunk → stems thicker, advance widths unchanged). Also shrank the outer contour, making glyphs look smaller. A subsequent v8.4 attempt with radial dilation caused uneven curve thickening and was removed; FontForge-based v2.1 is recommended for proper thickening via FontForge's changeWeight. |
 | **v8.3** | **Hint drift fix.** `--rebuild-hints` rebuilds CFF BlueValues/OtherBlues from OS/2 metrics **before** psautohint runs (was applied AFTER, which was useless). Fixes hidden bug: `head.flags` bit 3 (Force PPEM integer) survived via `\|=` because the previous code added bits without clearing the existing one. Now explicitly cleared. **`--weight-offset` now defaults to 0** (was silently +50 with `--solid`), which preserves `fc-match` correctness. |
 | **v8.2** | `--hint-tune` for CFF Private dict (synthesises BlueValues, sets LanguageGroup, ExpansionFactor, BlueShift/BlueFuzz). `--shape-cleanup` for TrueType outline collinear/dedup removal. `--gasp-detail` for granular GASP control. Stem width normalisation. Subpixel coordinate snapping. Long-glyph-name auto-exclusion for emoji fonts (Apple, Google). All v8.1 features preserved. |
 | **v8.1** | `--solid` mode (weight class, bold bit, aggressive GASP). `--thickness` (non-uniform X scaling for bold effect). `--clear-shaping` mode. `--weight-offset`, `--x-height-hint`, `--hinting-range-min/max`, `--gasp-mode`. Chrome compatibility fixes. |
 | **v8** | Initial scaling support (`--scale`). TrueType + CFF auto-hinting. Directory batch processing. |
-| **ff-v2.0** | FontForge-based equivalent of v8.2 (FontForge autoHint for hinting, no external psautohint dependency). |
+| **ff-v2.1** | FontForge-based equivalent of v8.2 (FontForge autoHint for hinting, no external psautohint dependency). |
+| **ff-v2.1** | FontForge-based equivalent of v8.x. v2.0 → v2.1 added: `--width/--expand/--condense` for horizontal scaling (A), fringe-elimination phases (B): `_phase_stem_normalise`, `_phase_flatten_curves`, `_phase_collinear_remove`, etc., `--gasp-detail {minimal,standard,aggressive}` (C), `--shape-cleanup` (D), better CFF BlueValues synthesis from OS/2 metrics (E), `--rebuild-hints` flag (H). |
 | **ttf2otf_ff_v5** | Fringe elimination specialist (FontForge). v4 → v5 added: `--width` for horizontal expand/condense, `--quantise-curve` for Bezier flattening, `--blue-quantise` for BlueValues grid rounding, `_phase_flatten_curves`, `_phase_stem_align`, `_phase_bezier_integrity`, `_phase_extra_global`, `_phase_quantise_blue_values`. More aggressive anti-fringe passes per glyph. |
 
 ### Dependencies
@@ -285,7 +284,7 @@ Add `--hint-tune`. Many foundry fonts ship without `BlueValues`, which means psa
 | `--solid` | **Master switch for solid, concrete rendering.** Activates: OS/2 weight class bump (+50), head macStyle bold bit (on weight ≥600), aggressive GASP table (grid-fit + AA + symmetric), expanded hinting range (4-128ppem). Includes all `--clear-shaping` features. | off |
 | `--clear-shaping` | Clearer shaping: enhanced hinting ranges, ClearType compatibility, GASP table optimisation, head table flag tuning, overlap removal. | off |
 | `--scale FLOAT` | **Uniform scale percentage.** Positive = larger, negative = smaller. Applied as pre-processing before hinting. | 0 |
-| `--thickness FLOAT` | **[v8.4 RADIAL DILATION] Thicken stems by dilating each contour from the glyph center. Outer contour expands outward (glyph grows slightly), inner counter shrinks inward (counter smaller). Stems appear thicker on BOTH sides. Advance widths preserved. `2.5` = subtle bolder, `10` = clearly thicker. Recommended: 1-10. Works alongside `--scale`. | 0 |
+| `--thickness FLOAT` | **[inset-rescale] Thicken stems by dilating each contour from the glyph center. Outer contour expands outward (glyph grows slightly), inner counter shrinks inward (counter smaller). Stems appear thicker on BOTH sides. Advance widths preserved. `2.5` = subtle bolder, `10` = clearly thicker. Recommended: 1-10. Works alongside `--scale`. | 0 |
 | `--weight-offset INT` | Amount to add to OS/2 usWeightClass for bolder appearance. Default with `--solid`: 50. | 0 |
 | `--x-height-hint INT` | Percentage to increase x-height for better small-size legibility (e.g., 3 = 3% larger lowercase). Recommended: 2-5. | 0 |
 | `--hinting-range-min INT` | Minimum ppem for hinting generation. Lower = better tiny-size rendering. Default: 8 (standard), 6 (with `--clear-shaping`), 4 (with `--solid`). | auto |
