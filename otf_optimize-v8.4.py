@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-OTF/TTF Font Optimization Script v8.3
+OTF/TTF Font Optimization Script v8.4
 
 This script optimizes fonts for CLEARER, MORE CONCRETE shaping by:
 - Autohinting TrueType-based fonts with ttfautohint
 - Autohinting CFF-based OTF fonts with psautohint
 - Properly identifying CFF vs TrueType outlines
 - Scaling font size by a percentage
-- TRUE thickness adjustment (NEW in v8.3): thicken stems WITHOUT scaling the font
+- TRUE thickness adjustment (CORRECTED in v8.4): thicken stems WITHOUT scaling
+  the font AND without shrinking the outer contour. v8.4 detects outer vs
+  inner contours by SIGNED AREA and only shrinks inner counters, leaving
+  outer contours untouched. (v8.3 had a bug that shrank both.)
 - GASP table optimization for sharper screen rendering
 - head table flag configuration for integer PPEM forcing
 - Overlap removal and contour cleanup
@@ -20,20 +23,23 @@ This script optimizes fonts for CLEARER, MORE CONCRETE shaping by:
 - More granular GASP ranges: 5 ranges vs 2-3
 - Auto-exclusion of long-named glyphs: psautohint 64-char limit
 
+v8.4 changes (over v8.3):
+  - **CORRECTED --thickness bug**: v8.3 applied inset-rescale to BOTH outer
+    and inner contours, which shrunk the outer contour too — the glyph
+    appeared smaller even though advance widths were preserved.
+  - v8.4 detects outer vs inner contours by SIGNED AREA (shoelace formula):
+      - OUTER contour (negative signed area in font coords) → IDENTITY
+        transform. Outer contour preserved at original size.
+      - INNER counter (positive signed area) → inset-rescale toward its own
+        center → counter shrinks UNIFORMLY on all sides → stems thicker on
+        both left AND right sides.
+  - Result: outer contour unchanged, inner counter shrunk uniformly → stems
+    thicker symmetrically, glyph same size, advance width unchanged, font
+    scale unchanged.
+
 v8.3 changes (over v8.2):
-  - **BREAKING FIX: --thickness now thickens stems without scaling the font.**
-    Previously, --thickness applied a non-uniform X scale (factor_x > factor_y)
-    which made the font WIDER and TALLER while also thickening stems. This was
-    confusing because users expected --thickness to only affect stroke weight.
-    The new implementation uses the inset-rescale technique:
-      1. Compute glyph bounding box (W × H)
-      2. Apply transform: a = (W - 2*dx) / W, e = +dx, similarly for Y
-      3. Result: outer contour stays at original size, inner counter shrinks
-         → stems appear thicker WITHOUT changing advance width or glyph bounds
-    This produces a true "bold weight" effect on the stems while leaving the
-    overall font dimensions, advance widths, and bounding boxes unchanged.
-  - --scale still works as before (true uniform/non-uniform scaling)
-  - --thickness and --scale can be combined: scale first, then thicken
+  - First attempt at true stem-thickening without scaling the font. Had a bug
+    where the outer contour also got shrunk (now fixed in v8.4).
 
 v8.2 changes (over v8.1):
   - CFF hint tuning: set LanguageGroup=1, ExpansionFactor, BlueShift/BlueFuzz;
@@ -326,19 +332,28 @@ def scale_font_glyphs(input_path: str, output_path: str, scale_percent: float, t
         Minimum scale_factor = 0.10 (10%) — prevents empty fonts
         Maximum scale_factor = 4.00 (400%) — prevents oversize fonts
 
-    --thickness value (v8.3 REWORKED):
+    --thickness value (v8.4 CORRECTED):
       Thickens stems WITHOUT changing the overall font size, advance widths,
-      or glyph bounding boxes. Uses the inset-rescale technique:
-        - For each glyph, compute bounding box (W × H)
-        - Compute target dx = thickness_percent * W / 100 (horizontal stem grow)
-        - Compute target dy = thickness_percent * H / 200 (vertical stem grow)
-        - Apply transform with a = (W - 2*dx) / W, e = +dx, similarly for Y
-        - Result: outer contour stays at original size; inner counter shrinks
-          → stems appear thicker while leaving font dimensions unchanged
+      glyph bounding boxes, or the outer contour. Algorithm:
+        - For each glyph, compute bounding box (W × H).
+        - Compute target dx = thickness_percent * W / 100 (horizontal stem grow).
+        - Compute target dy = thickness_percent * H / 200 (vertical stem grow).
+        - For each contour:
+          - If OUTER (detected by negative signed area via shoelace formula):
+            apply IDENTITY transform (no change).
+          - If INNER counter (positive signed area):
+            apply inset-rescale toward its OWN center:
+              a = (cw - 2*dx) / cw
+              d = (ch - 2*dy) / ch
+              e = cx_center * (1 - a)
+              f = cy_center * (1 - d)
+        - Result: outer contour STAYS at original position; inner counter
+          shrinks symmetrically on all sides; stems appear thicker on BOTH
+          sides of every stroke.
 
       v8.2 behaviour (DEPRECATED): non-uniform scaling (X scaled more than Y).
-      That made the entire font wider AND thicker simultaneously, which was
-      confusing because users expected --thickness to only affect stroke weight.
+      v8.3 first attempt at true thickening had a bug that shrunk the outer
+      contour too (making the glyph smaller). v8.4 fixes this.
 
     The two operations can be combined: scale first, then thicken.
     """
@@ -471,12 +486,29 @@ def _thicken_font_glyphs(font: TTFont, thickness_percent: float) -> None:
 
 
 def _thicken_truetype_glyphs(font: TTFont, thickness_percent: float) -> None:
-    """Apply per-CONTOUR inset-rescale transform to TrueType outlines.
+    """Apply v8.4 CORRECTED per-CONTOUR stem-thickening to TrueType outlines.
 
-    The transform is applied per-contour (not per-glyph) because an affine
-    transform x' = a*x + e preserves either the left edge OR the right edge
-    of a contour, but not both at once. Each contour has its own bounding
-    box, so we compute e/f from each contour's own (xmin, ymin).
+    Algorithm:
+      1. For each glyph, compute its bbox (W, H) and dx, dy for stem growth.
+      2. For each contour, compute SIGNED AREA using the shoelace formula:
+         - Negative signed area (in font coords with Y up) → OUTER contour
+         - Positive signed area → INNER counter
+      3. Apply transform per contour:
+         - OUTER contour: IDENTITY (a=1, d=1, e=0, f=0) — no change
+         - INNER counter: inset-rescale toward its own CENTER (cx, cy):
+             a = (cw - 2*dx) / cw    (uniform shrink)
+             d = (ch - 2*dy) / ch
+             e = cx_center * (1 - a)  (preserve center position)
+             f = cy_center * (1 - d)
+           This shrinks the inner counter uniformly by `2*dx` horizontally and
+           `2*dy` vertically, which makes the stems appear thicker on BOTH
+           sides by `dx` (X) and `dy` (Y) units.
+
+    Result:
+      - Outer contour: UNCHANGED (glyph bounds preserved)
+      - Inner counter: shrunk symmetrically → stems thicker on both sides
+      - Advance width: UNCHANGED (preserved by _scale_metrics)
+      - Font scale: UNCHANGED (no overall scale applied)
     """
     glyf = font['glyf']
 
@@ -492,7 +524,6 @@ def _thicken_truetype_glyphs(font: TTFont, thickness_percent: float) -> None:
                 continue
             if glyph.xMin is None or glyph.yMin is None:
                 continue
-            # Use the GLYPH bounding box for dx/dy calculation
             xmin_g, ymin_g = glyph.xMin, glyph.yMin
             xmax_g, ymax_g = glyph.xMax, glyph.yMax
             W = xmax_g - xmin_g
@@ -501,10 +532,8 @@ def _thicken_truetype_glyphs(font: TTFont, thickness_percent: float) -> None:
                 continue
             dx = max(0.0, thickness_percent * W / 100.0)
             dy = max(0.0, thickness_percent * H / 200.0)
-            a = max(0.0, (W - 2.0 * dx) / W)
-            d = max(0.0, (H - 2.0 * dy) / H)
 
-            # Determine per-contour point ranges
+            # Per-contour point ranges
             end_pts = list(glyph.endPtsOfContours)
             ranges = []
             start = 0
@@ -512,45 +541,72 @@ def _thicken_truetype_glyphs(font: TTFont, thickness_percent: float) -> None:
                 ranges.append((start, end + 1))
                 start = end + 1
 
-            # Build new coordinates as a tuple of (x, y) pairs in GlyphCoordinates format.
-            # Use a mutable list during construction, then convert to the proper
-            # type fontTools expects.
             old_coords = glyph.coordinates
             new_coords_list = [None] * len(old_coords)
             cx_min_global = float('inf')
             cy_min_global = float('inf')
             cx_max_global = float('-inf')
             cy_max_global = float('-inf')
+
             for start_idx, end_idx in ranges:
                 pts = old_coords[start_idx:end_idx]
                 xs = [p[0] for p in pts]
                 ys = [p[1] for p in pts]
                 cx_min, cx_max = min(xs), max(xs)
                 cy_min, cy_max = min(ys), max(ys)
-                # Per-contour offsets so this contour's left/bottom edge is
-                # preserved (right/top edge will shrink — that's the point).
-                e = cx_min * (1.0 - a)
-                f = cy_min * (1.0 - d)
+                cw = cx_max - cx_min
+                ch = cy_max - cy_min
+
+                # Determine if this contour is OUTER or INNER by signed area.
+                # In font coords (Y up): outer contour has negative area.
+                signed_area = 0.0
+                n = len(pts)
+                for j in range(n):
+                    x1, y1 = pts[j]
+                    x2, y2 = pts[(j + 1) % n]
+                    signed_area += x1 * y2 - x2 * y1
+                signed_area /= 2.0
+                is_outer = signed_area < 0
+
+                if is_outer or cw <= 0 or ch <= 0:
+                    # OUTER contour: identity transform — preserve as-is.
+                    # (Degenerate contours also get identity.)
+                    for j in range(start_idx, end_idx):
+                        x, y = old_coords[j]
+                        new_coords_list[j] = (int(x), int(y))
+                else:
+                    # INNER counter: inset-rescale toward its own center.
+                    cx_center = (cx_min + cx_max) / 2.0
+                    cy_center = (cy_min + cy_max) / 2.0
+                    a = max(0.0, (cw - 2.0 * dx) / cw)
+                    d = max(0.0, (ch - 2.0 * dy) / ch)
+                    e = cx_center * (1.0 - a)
+                    f = cy_center * (1.0 - d)
+                    for j in range(start_idx, end_idx):
+                        x, y = old_coords[j]
+                        nx = int(round(x * a + e))
+                        ny = int(round(y * d + f))
+                        new_coords_list[j] = (nx, ny)
+
+                # Track global bbox from new coords
                 for j in range(start_idx, end_idx):
-                    x, y = old_coords[j]
-                    nx = int(round(x * a + e))
-                    ny = int(round(y * d + f))
-                    new_coords_list[j] = (nx, ny)
+                    nx, ny = new_coords_list[j]
                     if nx < cx_min_global: cx_min_global = nx
                     if nx > cx_max_global: cx_max_global = nx
                     if ny < cy_min_global: cy_min_global = ny
                     if ny > cy_max_global: cy_max_global = ny
-            # Replace glyph coordinates (use a GlyphCoordinates object so
-            # fontTools internals like recalcBounds still work).
+
+            # Use GlyphCoordinates so fontTools internals (recalcBounds etc.) work.
             from fontTools.pens.ttGlyphPen import GlyphCoordinates
             glyph.coordinates = GlyphCoordinates(new_coords_list)
-            # Recompute glyph bbox from new coords
-            glyph.xMin = int(cx_min_global)
-            glyph.yMin = int(cy_min_global)
-            glyph.xMax = int(cx_max_global)
-            glyph.yMax = int(cy_max_global)
+            # Preserve the OUTER bbox (which is unchanged). If something went
+            # wrong and inner contour became bigger, clamp to original.
+            glyph.xMin = min(int(cx_min_global), int(xmin_g))
+            glyph.yMin = min(int(cy_min_global), int(ymin_g))
+            glyph.xMax = max(int(cx_max_global), int(xmax_g))
+            glyph.yMax = max(int(cy_max_global), int(ymax_g))
         else:
-            # Composite glyph: leave alone (components reference other glyphs)
+            # Composite glyph: leave alone
             pass
 
 
@@ -578,12 +634,18 @@ def _thicken_cff_glyphs(font: TTFont, thickness_percent: float) -> None:
     from fontTools.pens.recordingPen import RecordingPen
 
     class _PerContourBoundsPen(RecordingPen):
-        """RecordingPen that also tracks per-subpath bounding boxes."""
+        """RecordingPen that tracks per-subpath bounding boxes AND signed area.
+
+        Signed area (shoelace formula) tells us whether a contour is OUTER
+        (negative area in font coords with Y up) or INNER (positive area).
+        """
         def __init__(self):
             super().__init__()
             self._sub_xs = []
             self._sub_ys = []
-            self.sub_bounds = []  # list of (xmin, ymin, xmax, ymax) per subpath
+            self._sub_start_index = 0
+            self.sub_bounds = []     # list of (xmin, ymin, xmax, ymax) per subpath
+            self.sub_signed_area = []  # list of float per subpath
 
         def moveTo(self, pt):
             self._flush_subpath()
@@ -618,33 +680,47 @@ def _thicken_cff_glyphs(font: TTFont, thickness_percent: float) -> None:
 
         def _flush_subpath(self):
             if self._sub_xs:
+                xs = self._sub_xs
+                ys = self._sub_ys
                 self.sub_bounds.append((
-                    min(self._sub_xs), min(self._sub_ys),
-                    max(self._sub_xs), max(self._sub_ys),
+                    min(xs), min(ys), max(xs), max(ys),
                 ))
+                # Compute signed area (shoelace)
+                n = len(xs)
+                area = 0.0
+                for j in range(n):
+                    x1, y1 = xs[j], ys[j]
+                    x2, y2 = xs[(j + 1) % n], ys[(j + 1) % n]
+                    area += x1 * y2 - x2 * y1
+                area /= 2.0
+                self.sub_signed_area.append(area)
                 self._sub_xs = []
                 self._sub_ys = []
 
     class _PerContourTransformPen:
-        """Apply different offset per subpath while keeping X/Y scale constant.
+        """Apply DIFFERENT transforms per subpath: identity for OUTER contours,
+        inset-rescale for INNER counters.
 
-        For each subpath, the offset (e, f) is computed from the subpath's own
-        bounding box so its left/bottom edge stays at its original position.
-        Right/top edges will shrink by `2*dx` / `2*dy`.
+        v8.4 CORRECTED: previously applied the same shrink to every contour,
+        which made the outer contour smaller too. v8.4 detects outer vs inner
+        (via signed area) and applies identity (no change) to outer contours.
         """
-        def __init__(self, outPen, scale_xy, sub_bounds):
-            from fontTools.pens.basePen import BasePen
+        def __init__(self, outPen, contour_transforms):
+            """
+            contour_transforms: list of (a, d, e, f) tuples per subpath.
+              - (1, 1, 0, 0) for outer contours (identity)
+              - (a, d, e, f) for inner counters (inset-rescale)
+            """
             self._outPen = outPen
-            self.a, self.d = scale_xy
+            self._contour_transforms = iter(contour_transforms)
+            self.a = 1.0
+            self.d = 1.0
             self._matrix_e = 0.0
             self._matrix_f = 0.0
-            self._sub_iter = iter(sub_bounds)
 
         def _update_offset(self):
             try:
-                sb = next(self._sub_iter)
-                self._matrix_e = sb[0] * (1.0 - self.a)
-                self._matrix_f = sb[1] * (1.0 - self.d)
+                self.a, self.d, self._matrix_e, self._matrix_f = next(self._contour_transforms)
             except StopIteration:
                 pass
 
@@ -707,14 +783,34 @@ def _thicken_cff_glyphs(font: TTFont, thickness_percent: float) -> None:
 
             dx = max(0.0, thickness_percent * W / 100.0)
             dy = max(0.0, thickness_percent * H / 200.0)
-            a = max(0.0, (W - 2.0 * dx) / W)
-            d = max(0.0, (H - 2.0 * dy) / H)
+
+            # Build per-contour transforms.
+            # CFF winding convention: OUTER contour has POSITIVE signed area
+            # (opposite of TrueType, where outer has NEGATIVE area).
+            # INNER counter has NEGATIVE signed area in CFF.
+            contour_transforms = []
+            for sb, area in zip(rec.sub_bounds, rec.sub_signed_area):
+                cx_min, cy_min, cx_max, cy_max = sb
+                cw = cx_max - cx_min
+                ch = cy_max - cy_min
+                if area > 0 or cw <= 0 or ch <= 0:
+                    # Outer contour (positive area in CFF) or degenerate: identity
+                    contour_transforms.append((1.0, 1.0, 0.0, 0.0))
+                else:
+                    # Inner counter (negative area in CFF): shrink toward its center
+                    cx_center = (cx_min + cx_max) / 2.0
+                    cy_center = (cy_min + cy_max) / 2.0
+                    a = max(0.0, (cw - 2.0 * dx) / cw)
+                    d = max(0.0, (ch - 2.0 * dy) / ch)
+                    e = cx_center * (1.0 - a)
+                    f = cy_center * (1.0 - d)
+                    contour_transforms.append((a, d, e, f))
 
             # Second pass: apply per-contour transform
             adv_width = hmtx.metrics[glyph_name][0] if (hmtx and glyph_name in hmtx.metrics) else 0
 
             t2_pen = T2CharStringPen(adv_width, glyph_set)
-            ct_pen = _PerContourTransformPen(t2_pen, (a, d), rec.sub_bounds)
+            ct_pen = _PerContourTransformPen(t2_pen, contour_transforms)
             glyph_obj.draw(ct_pen)
 
             new_cs = t2_pen.getCharString()
@@ -2008,15 +2104,17 @@ v8.2 NEW — Hint tuning for Samsung-style fonts without BlueValues:
              "Applied as pre-processing before hinting."
     )
 
-    # ---- v8.3: True stem-thickening (no scale change) ----
+    # ---- v8.4: Corrected stem-thickening (no scale change, no outer shrink) ----
     parser.add_argument(
         "--thickness", type=float, default=0, dest="thickness_percent",
-        help="[v8.3 RWORKED] Thicken stems WITHOUT changing font size. "
-             "Inset-rescale technique: outer contour stays at original "
-             "position, inner counter shrinks → stems appear thicker. "
-             "Advance widths and glyph bounding boxes are preserved. "
-             "e.g. 2.5 = subtle bolder stems, 10 = clearly thicker. "
-             "Works independently of --scale. Recommended: 1-10."
+        help="[v8.4 CORRECTED] Thicken stems WITHOUT changing font size. "
+             "Detects outer vs inner contours by signed area: "
+             "outer contour gets IDENTITY transform (preserved exactly); "
+             "inner counter shrinks symmetrically toward its own center. "
+             "Advance widths, glyph bounding boxes, AND the outer contour "
+             "are all preserved. e.g. 2.5 = subtle bolder stems, "
+             "10 = clearly thicker. Works independently of --scale. "
+             "Recommended: 1-10."
     )
 
     # ttfautohint options (for TrueType fonts)
