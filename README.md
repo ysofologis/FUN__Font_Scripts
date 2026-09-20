@@ -59,14 +59,15 @@ This command:
 - **Auto-hints** with psautohint (CFF) or ttfautohint (TrueType)
 - **Applies clear-shaping** post-processing (GASP table, head flags, etc.)
 
-### What's New in v8.2 (and v8.3/v8.4 updates)
+### What's New in v8.3 (and v8.2/v8.4 updates)
 
-v8.2 adds fontTools-based improvements for **clarity, shape quality, and fringe removal**:
+v8.3 fixes a fundamental misunderstanding of `--thickness`:
 
 | Feature | What it does | Impact |
 |---------|-------------|--------|
+| **`--thickness` REWORKED** | **[v8.3]** Now thickens stems WITHOUT changing font size. Old v8.2 behaviour applied a non-uniform X scale (factor_x > factor_y), which made the entire font wider AND taller while also thickening stems. New behaviour uses per-contour inset-rescale: each contour's left/bottom edge is preserved, its right/top edges shrink, and inner counters (e.g. the hole in 'O') shrink by `2*dx` horizontally — making stems appear thicker while keeping advance widths, glyph height, and font scale unchanged. | **Critical correctness fix** |
 | **`--hint-tune`** | CFF Private dict tuning: sets `LanguageGroup=1`, `ExpansionFactor`, `BlueShift/BlueFuzz`, and **synthesises `BlueValues`/`OtherBlues` from OS/2 metrics when the font has none**. Most Samsung-style fonts ship without alignment zones, so this is a massive improvement. | **Highest** |
-| **`--rebuild-hints`** | **[v8.3]** Rebuilds CFF `BlueValues`/`OtherBlues` from current OS/2 `sCapHeight`/`sxHeight` **even when they already exist**. Critical when scaling/thickening, since original BlueValues no longer match scaled outlines (causing hint drift). Applied BEFORE psautohint so hints are correctly aligned. | **High** |
+| **`--rebuild-hints`** | Rebuilds CFF `BlueValues`/`OtherBlues` from current OS/2 `sCapHeight`/`sxHeight` **even when they already exist**. Critical when scaling/thickening, since original BlueValues no longer match scaled outlines (causing hint drift). Applied BEFORE psautohint so hints are correctly aligned. | **High** |
 | **`--shape-cleanup`** | TrueType outline cleanup: removes collinear points (3+ on a line) and near-duplicate points (within 0.5 units). Cleaner curves, smoother rendering, smaller files. | Medium |
 | **`--gasp-detail {aggressive,balanced,minimal}`** | 5-range granular GASP table with optimal AA mode per range (vs v8.1's 4 ranges). | Medium |
 | **Stem width normalisation** | Rounds `StdHW`/`StdVW`/`StemSnapH`/`StemSnapV` to clean integers. | Low |
@@ -91,7 +92,7 @@ v8.2 adds fontTools-based improvements for **clarity, shape quality, and fringe 
 | `--gasp-detail {aggressive,balanced,minimal}` | Granular GASP control (5 ranges, optimal AA per range). | aggressive |
 | `--no-stem-round` | Skip stem width rounding (`StdHW`/`StdVW`/`StemSnap`). Used with `--hint-tune`. | off |
 | `--scale FLOAT` | **[v8.4 dual mode]** Scale font size: `\|value\| < 1.0` → direct multiplier (e.g. `0.5` = ×0.50 / 50% size); `\|value\| >= 1.0` → percentage change (e.g. `5` = +5%). Safety cap [0.10, 4.00]. | 0 |
-| `--thickness FLOAT` | **Extra thickness for vertical stems (%).** Thickens the font by applying more horizontal scaling. `10` = 10% thicker vertical stems. Recommended: 2-15. Applied before hinting. | 0 |
+| `--thickness FLOAT` | **[v8.3 REWORKED] Thicken stems WITHOUT changing font size.** Per-contour inset-rescale: outer contour's left/bottom preserved, inner counter shrinks by `2*dx` → stems appear thicker. Advance widths and overall font scale are preserved. `2.5` = subtle bolder stems, `10` = clearly thicker. Recommended: 1-10. Works alongside `--scale`. | 0 |
 | `--weight-offset INT` | **[v8.3 CHANGED]** Add this N to OS/2 `usWeightClass`. **Default 0 (no automatic bump)**. WARNING: bumping weight class can affect font matching (Fontconfig maps 400=Regular, 700=Bold). Only use when you understand the impact. Pass `--weight-offset 50` explicitly if needed. | 0 |
 | `--x-height-hint INT` | Percentage to increase x-height for better small-size legibility (e.g., 3 = 3% larger lowercase). Recommended: 2-5. | 0 |
 | `--hinting-range-min INT` | Minimum ppem for hinting generation. Lower = better tiny-size rendering. Default: 8 (standard), 6 (with `--clear-shaping`), 4 (with `--solid`). | auto |
@@ -187,12 +188,14 @@ All Chrome-breaking issues have been fixed:
 
 | Version | Key Changes |
 |---------|-------------|
-| **v8.4** | **Latest.** Added `\|value\| < 1.0` → direct multiplier mode to `--scale` (`--scale 0.5` now scales to 50%). Safety cap [0.10, 4.00]. |
+| **v8.3** | **Latest.** `--thickness` reworked: now thickens stems WITHOUT scaling the font. Uses per-contour inset-rescale technique (outer contour's left/bottom edge preserved, inner counter shrunk → stems appear thicker, advance widths unchanged). Old behavior (X scale > Y scale) was breaking the user's intent: --thickness used to grow the entire font. |
+| **v8.4** | Added `\|value\| < 1.0` → direct multiplier mode to `--scale` (`--scale 0.5` now scales to 50%). Safety cap [0.10, 4.00]. |
 | **v8.3** | **Hint drift fix.** `--rebuild-hints` rebuilds CFF BlueValues/OtherBlues from OS/2 metrics **before** psautohint runs (was applied AFTER, which was useless). Fixes hidden bug: `head.flags` bit 3 (Force PPEM integer) survived via `\|=` because the previous code added bits without clearing the existing one. Now explicitly cleared. **`--weight-offset` now defaults to 0** (was silently +50 with `--solid`), which preserves `fc-match` correctness. |
 | **v8.2** | `--hint-tune` for CFF Private dict (synthesises BlueValues, sets LanguageGroup, ExpansionFactor, BlueShift/BlueFuzz). `--shape-cleanup` for TrueType outline collinear/dedup removal. `--gasp-detail` for granular GASP control. Stem width normalisation. Subpixel coordinate snapping. Long-glyph-name auto-exclusion for emoji fonts (Apple, Google). All v8.1 features preserved. |
 | **v8.1** | `--solid` mode (weight class, bold bit, aggressive GASP). `--thickness` (non-uniform X scaling for bold effect). `--clear-shaping` mode. `--weight-offset`, `--x-height-hint`, `--hinting-range-min/max`, `--gasp-mode`. Chrome compatibility fixes. |
 | **v8** | Initial scaling support (`--scale`). TrueType + CFF auto-hinting. Directory batch processing. |
 | **ff-v2.0** | FontForge-based equivalent of v8.2 (FontForge autoHint for hinting, no external psautohint dependency). |
+| **ttf2otf_ff_v5** | Fringe elimination specialist (FontForge). v4 → v5 added: `--width` for horizontal expand/condense, `--quantise-curve` for Bezier flattening, `--blue-quantise` for BlueValues grid rounding, `_phase_flatten_curves`, `_phase_stem_align`, `_phase_bezier_integrity`, `_phase_extra_global`, `_phase_quantise_blue_values`. More aggressive anti-fringe passes per glyph. |
 
 ### Dependencies
 
@@ -281,7 +284,7 @@ Add `--hint-tune`. Many foundry fonts ship without `BlueValues`, which means psa
 | `--solid` | **Master switch for solid, concrete rendering.** Activates: OS/2 weight class bump (+50), head macStyle bold bit (on weight ≥600), aggressive GASP table (grid-fit + AA + symmetric), expanded hinting range (4-128ppem). Includes all `--clear-shaping` features. | off |
 | `--clear-shaping` | Clearer shaping: enhanced hinting ranges, ClearType compatibility, GASP table optimisation, head table flag tuning, overlap removal. | off |
 | `--scale FLOAT` | **Uniform scale percentage.** Positive = larger, negative = smaller. Applied as pre-processing before hinting. | 0 |
-| `--thickness FLOAT` | **Extra thickness for vertical stems (%).** Thickens the font by applying more horizontal scaling. `10` = 10% thicker vertical stems. Recommended: 2-15. Applied before hinting. | 0 |
+| `--thickness FLOAT` | **[v8.3 REWORKED] Thicken stems WITHOUT changing font size.** Per-contour inset-rescale: outer contour's left/bottom preserved, inner counter shrinks by `2*dx` → stems appear thicker. Advance widths and overall font scale are preserved. `2.5` = subtle bolder stems, `10` = clearly thicker. Recommended: 1-10. Works alongside `--scale`. | 0 |
 | `--weight-offset INT` | Amount to add to OS/2 usWeightClass for bolder appearance. Default with `--solid`: 50. | 0 |
 | `--x-height-hint INT` | Percentage to increase x-height for better small-size legibility (e.g., 3 = 3% larger lowercase). Recommended: 2-5. | 0 |
 | `--hinting-range-min INT` | Minimum ppem for hinting generation. Lower = better tiny-size rendering. Default: 8 (standard), 6 (with `--clear-shaping`), 4 (with `--solid`). | auto |
