@@ -1,7 +1,23 @@
-| `--width FLOAT` | **[v8.5 NEW] Adjust horizontal width only.** Positive = expand (e.g. 5 = 5%% wider), negative = condense (e.g. -8 = 8%% narrower). Affects outlines + advance widths + horizontal metrics. **Aliases: `--expand N`, `--condense N`**. Independent of --scale. | 0 |
+| `--width FLOAT` | **[v8.5 NEW] Adjust horizontal width only.** Positive = expand (e.g. 5 = 5% wider), negative = condense (e.g. -8 = 8% narrower). Affects outlines + advance widths + horizontal metrics. **Aliases: `--expand N`, `--condense N`**. Independent of `--scale`. Safety cap [0.10, 4.00]. | 0 |
+
+| `--expand FLOAT` | **[v8.5 NEW]** Alias for `--width` with positive value. `e.g. --expand 5` = `--width 5`. Mutually exclusive with `--width`. | — |
+
+| `--condense FLOAT` | **[v8.5 NEW]** Alias for `--width` with negative value. `e.g. --condense 8` = `--width -8`. Mutually exclusive with `--width`. | — |
+
+| `--blue-quantise INT` | **[v8.5 NEW]** Round CFF `BlueValues`/`OtherBlues`/`FamilyBlues` to a clean N-unit grid. Eliminates fractional values that can cause rasteriser mis-snap. `0` = disabled (default), `1` = each unit (highest precision), `2/4/8` = cleaner grid. | 0 |
+
+| `--no-thickness` | **[v8.5 NEW]** Disable `--thickness` (escape hatch for scripts that pass `--thickness 0` from elsewhere). | off |
 
 # Font Rendering Optimizer
-| `--width FLOAT` | **[v8.5 NEW] Adjust horizontal width only.** Positive = expand (e.g. 5 = 5%% wider), negative = condense (e.g. -8 = 8%% narrower). Affects outlines + advance widths + horizontal metrics. **Aliases: `--expand N`, `--condense N`**. Independent of --scale. | 0 |
+| `--width FLOAT` | **[v8.5 NEW] Adjust horizontal width only.** Positive = expand (e.g. 5 = 5% wider), negative = condense (e.g. -8 = 8% narrower). Affects outlines + advance widths + horizontal metrics. **Aliases: `--expand N`, `--condense N`**. Independent of `--scale`. Safety cap [0.10, 4.00]. | 0 |
+
+| `--expand FLOAT` | **[v8.5 NEW]** Alias for `--width` with positive value. `e.g. --expand 5` = `--width 5`. Mutually exclusive with `--width`. | — |
+
+| `--condense FLOAT` | **[v8.5 NEW]** Alias for `--width` with negative value. `e.g. --condense 8` = `--width -8`. Mutually exclusive with `--width`. | — |
+
+| `--blue-quantise INT` | **[v8.5 NEW]** Round CFF `BlueValues`/`OtherBlues`/`FamilyBlues` to a clean N-unit grid. Eliminates fractional values that can cause rasteriser mis-snap. `0` = disabled (default), `1` = each unit (highest precision), `2/4/8` = cleaner grid. | 0 |
+
+| `--no-thickness` | **[v8.5 NEW]** Disable `--thickness` (escape hatch for scripts that pass `--thickness 0` from elsewhere). | off |
 
 
 
@@ -35,7 +51,7 @@ This directory contains Python scripts for improving OTF/TTF font rendering qual
 
 
 
-The latest and recommended script for **font scaling, widening/narrowing, thickening, auto-hinting, hint tuning, and solid/concrete rendering** using `ttfautohint` (TrueType) and `psautohint` (CFF/OTF). Built entirely on fontTools.
+The latest fontTools-based script for **font scaling, widening/narrowing, thickening, auto-hinting, hint tuning, and solid/concrete rendering** using `ttfautohint` (TrueType) and `psautohint` (CFF/OTF). v8.5 adds safe, additive improvements over v8.3 without breaking v8.3's `--thickness` behavior.
 
 
 
@@ -53,25 +69,31 @@ pip install fonttools ttfautohint psautohint
 
 # Proven command (recommended for Samsung & similar Korean fonts)
 
-python otf_optimize-v8.3.py --solid --hint-tune --rebuild-hints --thickness 2.5 --scale 5.0 input_fonts/ output_fonts/
+python otf_optimize-v8.5.py --solid --hint-tune --rebuild-hints --thickness 2.5 --scale 5.0 input_fonts/ output_fonts/
 
 
 
 # Basic optimisation
 
-python otf_optimize-v8.3.py input_fonts/ output_fonts/
+python otf_optimize-v8.5.py input_fonts/ output_fonts/
 
 
 
 # Just clear shaping (lighter touch)
 
-python otf_optimize-v8.3.py --clear-shaping input_fonts/ output_fonts/
+python otf_optimize-v8.5.py --clear-shaping input_fonts/ output_fonts/
+
+
+
+# Make a semi-condensed variant (NEW in v8.5)
+
+python otf_optimize-v8.5.py --condense 8 ./input/ ./output/
 
 
 
 # Maximum boldness (use with caution - see weight-offset warning below)
 
-python otf_optimize-v8.3.py --solid --thickness 15 --weight-offset 80 input_fonts/ output_fonts/
+python otf_optimize-v8.5.py --solid --thickness 15 --weight-offset 80 input_fonts/ output_fonts/
 
 ```
 
@@ -83,7 +105,7 @@ python otf_optimize-v8.3.py --solid --thickness 15 --weight-offset 80 input_font
 
 ```bash
 
-python /storage/drive-S/Work/SideProjects/fonts/otf_optimize-v8.3.py \
+python /storage/drive-S/Work/SideProjects/fonts/otf_optimize-v8.5.py \
 
   --solid \
 
@@ -106,26 +128,44 @@ python /storage/drive-S/Work/SideProjects/fonts/otf_optimize-v8.3.py \
 This command:
 
 - **Scales up** the font by 5% (`--scale 5.0`)
-
 - **Thickens** vertical stems by 2.5% (`--thickness 2.5`)
-
 - **Enables solid mode** (`--solid`) for concrete, bolder rendering
-
 - **Tunes CFF hinting** (`--hint-tune`) — synthesises BlueValues/OtherBlues when
 
   the font has none, sets LanguageGroup=1, ExpansionFactor, BlueShift/BlueFuzz.
-
 - **Rebuilds hints** (`--rebuild-hints`) — fixes hint drift after scaling/thickening.
 
   **This is the single highest-impact fix for fringe elimination.**
-
 - **Auto-hints** with psautohint (CFF) or ttfautohint (TrueType)
-
 - **Applies clear-shaping** post-processing (GASP table, head flags, etc.)
 
 
 
-### What's New in v8.3
+### What's New in v8.5 (over v8.3)
+
+
+
+v8.5 is a SAFE additive update — it does NOT change v8.3's `--thickness` behavior. New features only activate when their flags are used.
+
+
+
+| Feature | What it does | Impact |
+
+|---------|-------------|--------|
+
+| **`--width / --expand / --condense`** | **[v8.5 NEW]** Horizontal-only width adjustment. Positive = expand (`--expand 5` = 5% wider), negative = condense (`--condense 8` = 8% narrower). Affects outlines + advance widths + horizontal metrics. **Independent of `--scale`**: --scale is uniform, --width is horizontal-only. Use cases: semi-condensed variants, expanded display variants. | High |
+
+| **`--blue-quantise N`** | **[v8.5 NEW]** Round CFF `BlueValues`/`OtherBlues`/`FamilyBlues` to a clean N-unit grid. Eliminates fractional values that can cause rasteriser mis-snap. `0` = disabled (default), `1` = each unit (highest precision), `2/4/8` = cleaner grid. | Medium |
+
+| **`--no-thickness`** | **[v8.5 NEW]** Escape hatch to disable `--thickness` even if a config file or wrapper passes `--thickness 0` or similar. Useful for scripts. | Low |
+
+| **Improved `--hint-tune`** | **[v8.5 IMPROVED]** `_tune_cff_hinting()` now synthesises **proper 4-zone BlueValues** (descender + baseline + x-height + cap-height) instead of just 2 zones. Zone width is UPM-aware (`UPM/100`, ~10 for UPM 1000). Better descender zone handling. | High |
+
+| **Improved `--rebuild-hints`** | **[v8.5 IMPROVED]** Same 4-zone synthesis, ensuring rebuilt BlueValues match the current scaled outline positions. | High |
+
+
+
+### What's New in v8.3 (preserved in v8.5)
 
 
 
@@ -231,37 +271,83 @@ v8.3 fixes a fundamental misunderstanding of `--thickness`:
 
 # Proven command (recommended for Samsung-style fonts)
 
-python otf_optimize-v8.3.py --solid --hint-tune --thickness 2.5 --scale 5.0 ./input/ ./output/
+python otf_optimize-v8.5.py --solid --hint-tune --thickness 2.5 --scale 5.0 ./input/ ./output/
 
 
 
 # Clear shaping only (no boldness, lighter touch)
 
-python otf_optimize-v8.3.py --clear-shaping ./input/ ./output/
+python otf_optimize-v8.5.py --clear-shaping ./input/ ./output/
 
 
 
 # Heavy bold with full v8.2 pipeline
 
-python otf_optimize-v8.3.py --solid --hint-tune --shape-cleanup --thickness 15 --weight-offset 80 ./input/ ./output/
+python otf_optimize-v8.5.py --solid --hint-tune --shape-cleanup --thickness 15 --weight-offset 80 ./input/ ./output/
 
 
 
 # Just hint tuning (for fonts with no BlueValues, like Samsung)
 
-python otf_optimize-v8.3.py --hint-tune ./input/ ./output/
+python otf_optimize-v8.5.py --hint-tune ./input/ ./output/
 
 
 
 # Custom GASP granularity
 
-python otf_optimize-v8.3.py --solid --hint-tune --gasp-detail minimal ./input/ ./output/
+python otf_optimize-v8.5.py --solid --hint-tune --gasp-detail minimal ./input/ ./output/
 
 
 
 # Scale up 10% with hint tuning
 
-python otf_optimize-v8.3.py --clear-shaping --hint-tune --scale 10 ./input/ ./output/
+python otf_optimize-v8.5.py --clear-shaping --hint-tune --scale 10 ./input/ ./output/
+
+
+
+# ---- v8.5 NEW: Width / condense / expand ----
+
+# Make a semi-condensed variant of a font (8% narrower)
+
+python otf_optimize-v8.5.py --condense 8 ./input/ ./output/
+
+
+
+# Make an expanded display variant (5% wider)
+
+python otf_optimize-v8.5.py --expand 5 ./input/ ./output/
+
+
+
+# Use --width directly with negative value (condense 12%)
+
+python otf_optimize-v8.5.py --width -12 ./input/ ./output/
+
+
+
+# Combine width adjust with scale + thickness (independent ops)
+
+python otf_optimize-v8.5.py --scale 5.0 --width -3 --thickness 2.5 ./input/ ./output/
+
+
+
+# ---- v8.5 NEW: BlueValues quantisation ----
+
+# Round BlueValues to a clean 8-unit grid (eliminates fractional mis-snaps)
+
+python otf_optimize-v8.5.py --hint-tune --blue-quantise 8 ./input/ ./output/
+
+
+
+# Full CFF hint optimisation with quantised zones
+
+python otf_optimize-v8.5.py --solid --hint-tune --rebuild-hints --blue-quantise 4 ./input/ ./output/
+
+
+
+# ---- v8.5 NEW: Disable thickness from a config script ----
+
+python otf_optimize-v8.5.py --no-thickness --solid ./input/ ./output/
 
 ```
 
@@ -285,6 +371,11 @@ Input font (.otf/.ttf)
 
        │       └─ CFF: TransformPen → T2CharStringPen → new CharStrings
 
+       │
+
+       ├─► [--width / --expand / --condense] (v8.5 NEW) Horizontal-only scaling
+       │     Affects outlines + advance widths + horizontal metrics
+       │     (vertical metrics unchanged)
        │
 
        ├─► Analyse format: glyf (TrueType) vs CFF/CFF2 (OTF)
