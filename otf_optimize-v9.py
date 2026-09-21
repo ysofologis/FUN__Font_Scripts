@@ -210,7 +210,14 @@ def _tune_cff_hinting(font: Font, rebuild: bool = False, blue_quantise: int = 0)
     # Save existing hinting data (so we can preserve user's settings if rebuild=False)
     saved_data = font.t_cff_.get_hinting_data() if not rebuild else {}
 
-    # Apply canonical defaults (only if missing)
+    # Apply canonical defaults for Latin fonts (only if missing).
+    # These are CRITICAL for clean hinting:
+    #   - LanguageGroup=1: Latin horizontal-stem hinting (CJK uses 0 which
+    #     causes fringing in Latin fonts)
+    #   - ExpansionFactor=0.06: stem growth tolerance (lower = tighter hints)
+    #   - BlueShift=1: max units a stem can bloat before snapping to zone
+    #     (Latin fonts want tight snapping; 7 is way too loose)
+    #   - BlueFuzz=1: tolerance for zone matching
     if not getattr(private, 'LanguageGroup', None):
         private.LanguageGroup = 1
     if getattr(private, 'ExpansionFactor', None) is None:
@@ -218,7 +225,7 @@ def _tune_cff_hinting(font: Font, rebuild: bool = False, blue_quantise: int = 0)
     if getattr(private, 'BlueFuzz', None) is None:
         private.BlueFuzz = 1
     if getattr(private, 'BlueShift', None) is None:
-        private.BlueShift = 7
+        private.BlueShift = 1   # Was 7, but 1 is correct for Latin
 
     # If rebuild=True: recalculate zones and stems from real glyph analysis.
     # HYBRID strategy:
@@ -857,7 +864,12 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
                 logger.warning(f"Round coordinates failed: {e}")
 
         # ---- Step 6: Tune CFF hinting ----
-        if font.is_ps and options.get('hint_tune', False):
+        # --hint-tune alone: tune defaults (LanguageGroup=1, etc.)
+        # --rebuild-hints alone: rebuild zones/stems from real metrics (also sets defaults)
+        # Either flag triggers tuning because both are necessary for proper Latin
+        # hinting (LanguageGroup=1 is critical to avoid CJK-style hinting that
+        # causes fringing in Latin fonts).
+        if font.is_ps and (options.get('hint_tune', False) or options.get('rebuild_hints', False)):
             _tune_cff_hinting(
                 font,
                 rebuild=options.get('rebuild_hints', False),
