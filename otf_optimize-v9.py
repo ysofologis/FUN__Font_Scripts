@@ -579,8 +579,146 @@ def _thicken_cff_glyphs(font: Font, thickness: float) -> None:
     for name, cs in new_charstrings.items():
         char_strings[name] = cs
 
+    # Fix CFF winding direction after thicken
+    # CRITICAL: skia paths use Y-down (screen) coordinates, but CFF uses
+    # Y-up (font). After converting skia union to T2 charstring, contour
+    # winding directions get REVERSED. For glyphs with inner counters
+    # (o, O, e, b, p, etc.), this causes the renderer to treat the inner
+    # counter as a separate filled region instead of as a hole.
+    # Result: solid discs where there should be holes.
+    _fix_cff_windings_after_skia_op(font, thickened_glyphs=set(new_charstrings.keys()))
+
     logger.debug(f"Thickening complete: {thickened_count} glyphs thickened, "
                  f"{skipped_count} skipped")
+
+
+
+def _fix_cff_windings_after_skia_op(font: Font, thickened_glyphs: set) -> None:
+    """
+    Fix CFF winding direction for glyphs modified by skia operations.
+
+    Skia uses Y-down screen coordinates (CW = positive area).
+    CFF uses Y-up font coordinates (CCW = positive area).
+    When a skia path is converted to a T2 charstring, the winding direction
+    appears flipped. fontTools' CFF renderer uses non-zero winding rule, so
+    flipped windings cause inner counters (holes) to be filled as solid regions.
+
+    Fix: for each thickened glyph, compute contour areas. The largest contour
+    should be the OUTER (positive area). If it's negative, flip all contours
+    by reversing the point order in each contour.
+    """
+    if not font.is_ps:
+        return
+
+    char_strings = font.t_cff_.top_dict.CharStrings
+    font.ttfont['CFF '].cff.topDictIndex[0].decompileAllCharStrings()
+
+    from fontTools.pens.recordingPen import RecordingPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+
+    fixed_count = 0
+
+    for glyph_name in thickened_glyphs:
+        if glyph_name not in char_strings:
+            continue
+        cs = char_strings[glyph_name]
+        if cs.program is None or len(cs.program) <= 2:
+            continue
+
+        # Draw to get contours
+        rec = RecordingPen()
+        try:
+            cs.draw(rec)
+        except Exception:
+            continue
+
+        # Group into contours
+        contours = []
+        current = []
+        for cmd, pts in rec.value:
+            current.append((cmd, pts))
+            if cmd == 'closePath':
+                if current:
+                    contours.append(current)
+                current = []
+
+        if not contours:
+            continue
+
+        # Compute signed area of each contour
+        areas = []
+        for contour in contours:
+            points = []
+            for cmd, pts in contour:
+                for pt in pts:
+                    points.append(pt)
+            if len(points) < 3:
+                areas.append(0)
+                continue
+            n = len(points)
+            area = 0
+            for i in range(n):
+                x1, y1 = points[i]
+                x2, y2 = points[(i+1) % n]
+                area += (x1 * y2 - x2 * y1)
+            area /= 2
+            areas.append(area)
+
+        # Skip if glyph has no contours
+        if not areas:
+            continue
+
+        # Determine winding correctness.
+        # In CFF (Y-up): outer = positive area, inner (hole) = negative area.
+        # The OUTER contour should be the largest by absolute area, with
+        # POSITIVE signed area. All other contours should be NEGATIVE.
+        # If the largest contour is negative, windings are flipped.
+        max_idx = max(range(len(areas)), key=lambda i: abs(areas[i]))
+        if areas[max_idx] > 0:
+            # Largest is positive - but check if smaller contours are also
+            # positive (which would indicate flipped windings)
+            other_areas = [a for i, a in enumerate(areas) if i != max_idx]
+            if all(a < 0 for a in other_areas) or len(other_areas) == 0:
+                continue  # All windings already correct
+            # Some smaller contour is positive - windings are flipped
+            logger.debug(f"Winding flip detected for '{glyph_name}': areas={areas}")
+
+        # Flip windings: reverse point order in each contour
+        # This preserves moveTo at the start and closePath at the end
+        t2_pen = T2CharStringPen(cs.width, font.ttfont.getGlyphSet())
+        for contour in contours:
+            if not contour:
+                continue
+            move = contour[0]  # moveTo command
+            ops = contour[1:-1] if len(contour) > 2 else []  # line/curve ops
+            ops_rev = list(reversed(ops))  # reverse direction
+            # Write moveTo first
+            cmd, pts = move
+            if cmd == 'moveTo':
+                t2_pen.moveTo((pts[0][0], pts[0][1]))
+            # Then reversed ops
+            for cmd, pts in ops_rev:
+                if cmd == 'moveTo':
+                    t2_pen.moveTo((pts[0][0], pts[0][1]))
+                elif cmd == 'lineTo':
+                    t2_pen.lineTo((pts[0][0], pts[0][1]))
+                elif cmd == 'curveTo':
+                    t2_pen.curveTo((pts[0][0], pts[0][1]),
+                                   (pts[1][0], pts[1][1]),
+                                   (pts[2][0], pts[2][1]))
+                elif cmd == 'qCurveTo':
+                    t2_pen.qCurveTo((pts[0][0], pts[0][1]),
+                                    (pts[1][0], pts[1][1]))
+            # End with closePath
+            t2_pen.closePath()
+
+        new_cs = t2_pen.getCharString()
+        new_cs.private = font.t_cff_.top_dict.Private
+        char_strings[glyph_name] = new_cs
+        fixed_count += 1
+
+    if fixed_count > 0:
+        logger.debug(f"Fixed CFF windings for {fixed_count} glyphs (skia Y-down -> CFF Y-up)")
 
 
 
@@ -1066,11 +1204,12 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
         if options.get('width_percent', 0) != 0:
             width_font_glyphs(font, options['width_percent'])
 
-        # ---- Step 3: Thicken stems ----
-        if options.get('thickness_percent', 0) != 0:
-            _thicken_font_glyphs(font, options['thickness_percent'])
-
-        # ---- Step 4: Correct contours (overlap removal) ----
+        # ---- Step 3: Correct contours (overlap removal) ----
+        # IMPORTANT: This must run BEFORE thickening because correct_contours
+        # flips CFF contour winding directions. If thickening runs first and
+        # then correct_contours, the inner counters (holes) get filled in
+        # as solid discs because the flipped windings make the renderer
+        # treat the inner contour as a separate filled region.
         if options.get('shape_cleanup', False):
             try:
                 modified = font.correct_contours(
@@ -1082,6 +1221,10 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
                 logger.debug(f"Contour correction: {len(modified)} glyphs modified")
             except Exception as e:
                 logger.warning(f"Contour correction failed: {e}")
+
+        # ---- Step 4: Thicken stems ----
+        if options.get('thickness_percent', 0) != 0:
+            _thicken_font_glyphs(font, options['thickness_percent'])
 
         # ---- Step 5: Round coordinates (CFF only) ----
         if options.get('pixel_snap', 0) > 0 and font.is_ps:
