@@ -74,6 +74,7 @@ import traceback
 from pathlib import Path
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.ttFont import TTLibError
+from fontTools.ttLib.scaleUpem import scale_upem
 from fontTools.pens.t2CharStringPen import T2CharStringPen
 from fontTools.pens.transformPen import TransformPen
 
@@ -192,232 +193,50 @@ def analyze_font_type(font_path: str) -> dict:
 #  Font scaling (from v8)
 # ---------------------------------------------------------------------------
 
-def _scale_truetype_glyphs(font: TTFont, factor_x: float, factor_y: float) -> None:
-    """Scale all TrueType (glyf) glyph outlines by *factor_x* (horizontal) and *factor_y* (vertical)."""
-    glyf = font['glyf']
-
-    for glyph_name in font.getGlyphOrder():
-        if glyph_name not in glyf:
-            continue
-        glyph = glyf[glyph_name]
-
-        if glyph.numberOfContours == 0:
-            continue
-        elif glyph.numberOfContours > 0:
-            if glyph.coordinates is None or len(glyph.coordinates) == 0:
-                continue
-            coords = glyph.coordinates.copy()
-            for i in range(len(coords)):
-                x, y = coords[i]
-                coords[i] = (int(round(x * factor_x)), int(round(y * factor_y)))
-            glyph.coordinates = coords
-            xs = [p[0] for p in coords]
-            ys = [p[1] for p in coords]
-            glyph.xMin = int(round(min(xs)))
-            glyph.yMin = int(round(min(ys)))
-            glyph.xMax = int(round(max(xs)))
-            glyph.yMax = int(round(max(ys)))
-        else:
-            if not glyph.components:
-                continue
-            for comp in glyph.components:
-                if comp.x is not None:
-                    comp.x = int(round(comp.x * factor_x))
-                if comp.y is not None:
-                    comp.y = int(round(comp.y * factor_y))
-            if glyph.xMin is not None:
-                glyph.xMin = int(round(glyph.xMin * factor_x))
-                glyph.yMin = int(round(glyph.yMin * factor_y))
-                glyph.xMax = int(round(glyph.xMax * factor_x))
-                glyph.yMax = int(round(glyph.yMax * factor_y))
-
-
-def _scale_cff_glyphs(font: TTFont, factor_x: float, factor_y: float) -> bool:
-    """Scale all CFF charstring outlines by *factor_x* (horizontal) and *factor_y* (vertical)."""
-    cff_table_key = 'CFF2' if 'CFF2' in font else 'CFF '
-    top_dict = font[cff_table_key].cff.topDictIndex[0]
-    char_strings = top_dict.CharStrings
-    glyph_set = font.getGlyphSet()
-    hmtx = font.get('hmtx')
-
-    # v8.2: Ensure hmtx has entries for ALL glyphs (incl. long-named ones
-    # added by emoji fonts). fontTools' getGlyphSet() fails on glyphs
-    # missing from hmtx, even when their outlines are valid CFF charstrings.
-    if hmtx is not None:
-        glyph_order = font.getGlyphOrder()
-        for glyph_name in glyph_order:
-            if glyph_name not in hmtx.metrics:
-                hmtx.metrics[glyph_name] = (0, 0)
-        glyph_set = font.getGlyphSet()
-
-    new_charstrings = {}
-    had_errors = False
-
-    for glyph_name in font.getGlyphOrder():
-        if glyph_name not in char_strings or glyph_name not in glyph_set:
-            continue
-        try:
-            glyph = glyph_set[glyph_name]
-            if hmtx and glyph_name in hmtx.metrics:
-                scaled_width = int(round(hmtx.metrics[glyph_name][0] * factor_x))
-            else:
-                scaled_width = 0
-
-            t2_pen = T2CharStringPen(scaled_width, glyph_set)
-            transform_pen = TransformPen(t2_pen, (factor_x, 0, 0, factor_y, 0, 0))
-            glyph.draw(transform_pen)
-
-            new_charstring = t2_pen.getCharString()
-            new_charstring.private = top_dict.Private
-            new_charstrings[glyph_name] = new_charstring
-        except Exception as e:
-            logger.warning(f"Could not scale CFF glyph '{glyph_name}': {e}")
-            new_charstrings[glyph_name] = char_strings[glyph_name]
-            had_errors = True
-            continue
-
-    for name, cs in new_charstrings.items():
-        char_strings[name] = cs
-
-    if had_errors:
-        logger.warning("Some CFF glyphs could not be scaled and were left unchanged.")
-    return True
-
-
-def _scale_metrics(font: TTFont, factor_x: float, factor_y: float) -> None:
-    """Scale all metric tables. Horizontal metrics use factor_x, vertical use factor_y."""
-    if 'hmtx' in font:
-        hmtx = font['hmtx']
-        for glyph_name in list(hmtx.metrics.keys()):
-            aw, lsb = hmtx.metrics[glyph_name]
-            hmtx.metrics[glyph_name] = (
-                int(round(aw * factor_x)),
-                int(round(lsb * factor_x))
-            )
-
-    if 'vmtx' in font:
-        vmtx = font['vmtx']
-        for glyph_name in list(vmtx.metrics.keys()):
-            ah, tsb = vmtx.metrics[glyph_name]
-            vmtx.metrics[glyph_name] = (
-                int(round(ah * factor_y)),
-                int(round(tsb * factor_y))
-            )
-
-    if 'hhea' in font:
-        hhea = font['hhea']
-        hhea.ascent = int(round(hhea.ascent * factor_y))
-        hhea.descent = int(round(hhea.descent * factor_y))
-        hhea.lineGap = int(round(hhea.lineGap * factor_y))
-
-    if 'vhea' in font:
-        vhea = font['vhea']
-        vhea.ascent = int(round(vhea.ascent * factor_y))
-        vhea.descent = int(round(vhea.descent * factor_y))
-        vhea.lineGap = int(round(vhea.lineGap * factor_y))
-
-    if 'OS/2' in font:
-        os2 = font['OS/2']
-        os2.sTypoAscender = int(round(os2.sTypoAscender * factor_y))
-        os2.sTypoDescender = int(round(os2.sTypoDescender * factor_y))
-        os2.sTypoLineGap = int(round(os2.sTypoLineGap * factor_y))
-        os2.usWinAscent = int(round(os2.usWinAscent * factor_y))
-        os2.usWinDescent = int(round(os2.usWinDescent * factor_y))
-        if hasattr(os2, 'sxHeight') and os2.sxHeight:
-            os2.sxHeight = int(round(os2.sxHeight * factor_y))
-        if hasattr(os2, 'sCapHeight') and os2.sCapHeight:
-            os2.sCapHeight = int(round(os2.sCapHeight * factor_y))
-
-    if 'post' in font:
-        post = font['post']
-        post.underlinePosition = int(round(post.underlinePosition * factor_y))
-        post.underlineThickness = int(round(post.underlineThickness * factor_y))
-
-    if 'head' in font:
-        head = font['head']
-        if head.lowestRecPPEM:
-            head.lowestRecPPEM = max(1, int(round(head.lowestRecPPEM * factor_y)))
-        from fontTools.ttLib.tables._h_e_a_d import mac_epoch_diff
-        now = int(time.time())
-        head.modified = now + mac_epoch_diff if hasattr(head, 'modified') else now
-
-
 def scale_font_glyphs(input_path: str, output_path: str, scale_percent: float, thickness_percent: float = 0) -> bool:
     """
     Scale and/or thicken glyph outlines and metrics.
 
-    --scale value interpretation (v8.4):
-      - If --scale is in range [-10, 10]: interpreted as percentage change
-        (e.g. --scale 5 = +5%, --scale -5 = -5%). Negative shrinks the font.
-      - If --scale is outside that range (i.e. < -10 or >= 10): interpreted
-        as a direct multiplier (e.g. --scale 0.5 = 50% of original size).
-        Examples:
-          --scale 0.5 -> ×0.50 (50%)
-          --scale 0.75 -> ×0.75 (75%)
-          --scale 1.2 -> ×1.20 (120%)
-        This is more intuitive than "scale_percent" for "decrease scale" use cases.
+    v8.5 REFACTOR: This now delegates the SCALING part to
+    ``fontTools.ttLib.scaleUpem.scale_upem()``, which is fontTools' canonical
+    API for scaling all coordinates in a font (outlines, OS/2 metrics,
+    hmtx/vmtx, CFF BlueValues/OtherBlues, StdHW/StdVW/StemSnap*) by a
+    uniform factor. The THICKENING part remains custom (no fontTools
+    equivalent for non-uniform inset-rescale stem thickening).
 
-      Safety caps:
-        Minimum scale_factor = 0.10 (10%) — prevents empty fonts
-        Maximum scale_factor = 4.00 (400%) — prevents oversize fonts
+    --scale value interpretation (v8.4):
+      - |value| < 1.0  → direct multiplier (e.g. 0.5 = 50% size)
+      - |value| >= 1.0 → percentage change (e.g. 5 = +5%)
 
     --thickness value (v8.3 REWORKED):
       Thickens stems WITHOUT changing the overall font size, advance widths,
-      or glyph bounding boxes. Uses the inset-rescale technique:
-        - For each glyph, compute bounding box (W × H)
-        - Compute target dx = thickness_percent * W / 100 (horizontal stem grow)
-        - Compute target dy = thickness_percent * H / 200 (vertical stem grow)
-        - Apply transform with a = (W - 2*dx) / W, e = +dx, similarly for Y
-        - Result: outer contour stays at original size; inner counter shrinks
-          → stems appear thicker while leaving font dimensions unchanged
-
-      v8.2 behaviour (DEPRECATED): non-uniform scaling (X scaled more than Y).
-      That made the entire font wider AND thicker simultaneously, which was
-      confusing because users expected --thickness to only affect stroke weight.
-
-    The two operations can be combined: scale first, then thicken.
+      or glyph bounding boxes (inset-rescale technique).
     """
     if scale_percent == 0 and thickness_percent == 0:
         return False
 
     # --- v8.4: Interpret --scale intelligently ---
-    # Determine which mode based on the value's range:
-    #   |value| < 1.0  →  direct multiplier mode (e.g. 0.5 = ×0.5)
-    #   |value| >= 1.0 →  percentage change mode (e.g. 5 = +5%, -50 = -50%)
-    #
-    # Rationale: percentage-mode values are typically small changes (-20 to +20).
-    # Anything outside that range is almost certainly meant as a multiplier.
-    # The ±1 boundary keeps the most common "shrink to X%" use cases working
-    # intuitively (--scale 0.5 = 50%, --scale 0.75 = 75%).
     scale_abs = abs(scale_percent)
     if 0 < scale_abs < 1.0:
-        # Direct multiplier mode: --scale 0.5 = ×0.5 (50%)
         scale_factor = scale_percent
         mode = "multiplier"
         if scale_percent < 0:
             logger.warning(f"Negative multiplier {scale_percent:.3f} - "
                            f"treating as scale reduction (|x| < 1.0)")
-    elif scale_abs == 0 and thickness_percent == 0:
-        return False
     elif scale_abs >= 1.0:
-        # Percentage mode: --scale 5 = +5%, --scale -50 = -50%
         scale_factor = 1.0 + scale_percent / 100.0
         mode = "percentage"
     else:
-        # scale_percent == 0
         scale_factor = 1.0
         mode = "no-scale"
 
-    # Safety caps (apply only if user deviates wildly)
+    # Safety caps
     if scale_factor < 0.10:
         logger.warning(f"Scale factor {scale_factor:.3f} too small, capping at 0.10")
         scale_factor = 0.10
     elif scale_factor > 4.00:
         logger.warning(f"Scale factor {scale_factor:.3f} too large, capping at 4.00")
         scale_factor = 4.00
-
-    factor_x = scale_factor
-    factor_y = scale_factor
 
     logger.info(f"Scaling font ({mode}): scale x{scale_factor:.4f}, "
                 f"thickness {thickness_percent:+.2f}% "
@@ -428,21 +247,32 @@ def scale_font_glyphs(input_path: str, output_path: str, scale_percent: float, t
         has_truetype = 'glyf' in font
         has_cff = 'CFF ' in font or 'CFF2' in font
 
-        if has_truetype:
-            _scale_truetype_glyphs(font, factor_x, factor_y)
-        elif has_cff:
-            if not _scale_cff_glyphs(font, factor_x, factor_y):
-                font.close()
-                return False
-        else:
+        if not has_truetype and not has_cff:
             logger.error("Font has neither TrueType nor CFF outlines - cannot scale.")
             font.close()
             return False
 
-        _scale_metrics(font, factor_x, factor_y)
+        # ---- DELEGATE SCALING to fontTools.ttLib.scaleUpem.scale_upem ----
+        # This is fontTools' canonical API for uniform scaling. It scales:
+        #   - glyf glyph outlines (TrueType)
+        #   - CFF charstring outlines (desubroutinized + scaled)
+        #   - hmtx/vmtx advance widths + sidebearings
+        #   - hhea/vhea ascent/descent/lineGap
+        #   - OS/2 sTypoAscender/Descender/LineGap, usWinAscent/Descent,
+        #     sxHeight, sCapHeight
+        #   - head xMin/yMin/xMax/yMax + unitsPerEm
+        #   - post underlinePosition/Thickness
+        #   - CFF BlueValues, OtherBlues, FamilyBlues, FamilyOtherBlues,
+        #     StdHW, StdVW, StemSnapH, StemSnapV
+        #   - kern table, COLR, GPOS, etc.
+        # (BlueScale/BlueShift/BlueFuzz/ForceBold are NOT scaled - they're
+        # unit-less ratios, not font coordinates.)
+        if scale_factor != 1.0:
+            new_upem = int(round(font['head'].unitsPerEm * scale_factor))
+            scale_upem(font, new_upem)
+            logger.debug(f"Scaled via fontTools.scale_upem to upem={new_upem}")
 
-        # v8.3 NEW: Apply thickness AFTER scaling (true stem-thickening only)
-        # thickness_percent > 0 means stems thicker, no font-size change.
+        # ---- Thickness (custom, no fontTools equivalent) ----
         if thickness_percent > 0:
             _thicken_font_glyphs(font, thickness_percent)
 
@@ -470,6 +300,10 @@ def width_font_glyphs(input_path: str, output_path: str, width_percent: float) -
       - Hmtx/vmtx metrics (only horizontal axis)
       - OS/2 sTypoAscender/Descender/LineGap, usWinAscent/Descent (unchanged — vertical)
       - post underlinePosition/Thickness (unchanged — vertical)
+
+    Implementation uses fontTools' canonical ``TransformPen`` (fontTools.pens)
+    to apply the (factor, 0, 0, 1, 0, 0) affine transform. This is the same
+    pattern used by fontTools.ttLib.scaleUpem for non-uniform scaling.
 
     width_percent:
       - 0    = no change (returns False, no output)
@@ -502,18 +336,40 @@ def width_font_glyphs(input_path: str, output_path: str, width_percent: float) -
         has_truetype = 'glyf' in font
         has_cff = 'CFF ' in font or 'CFF2' in font
 
-        if has_truetype:
-            _scale_truetype_glyphs(font, factor, 1.0)
-        elif has_cff:
-            if not _scale_cff_glyphs(font, factor, 1.0):
-                font.close()
-                return False
-        else:
+        if not has_truetype and not has_cff:
             logger.error("Font has neither TrueType nor CFF outlines.")
             font.close()
             return False
 
-        _scale_metrics(font, factor, 1.0)
+        # Affine transform: scale X by factor, leave Y unchanged.
+        # (factor, 0, 0, 1, 0, 0) is the standard fontTools transform tuple.
+        transform = (factor, 0, 0, 1.0, 0, 0)
+
+        if has_truetype:
+            # TrueType: scale glyph coordinates + advance widths + LSB
+            _apply_horizontal_transform_truetype(font, transform)
+        else:
+            # CFF: rewrite charstrings through TransformPen + T2CharStringPen
+            _apply_horizontal_transform_cff(font, transform)
+
+        # Scale horizontal metrics (advance widths, sidebearings, hhea)
+        # Vertical metrics (OS/2 sTypoAscender, etc.) are intentionally untouched.
+        if 'hmtx' in font:
+            hmtx = font['hmtx']
+            for gn in list(hmtx.metrics.keys()):
+                aw, lsb = hmtx.metrics[gn]
+                hmtx.metrics[gn] = (int(round(aw * factor)),
+                                    int(round(lsb * factor)))
+        if 'hhea' in font:
+            hhea = font['hhea']
+            # hhea.advanceWidthMax needs X scaling
+            hhea.advanceWidthMax = int(round(hhea.advanceWidthMax * factor))
+            # minLeftSideBearing/minRightSideBearing/xMaxExtent are horizontal
+            for attr in ('minLeftSideBearing', 'minRightSideBearing', 'xMaxExtent'):
+                if hasattr(hhea, attr):
+                    v = getattr(hhea, attr)
+                    if v is not None:
+                        setattr(hhea, attr, int(round(v * factor)))
 
         font.save(output_path)
         font.close()
@@ -523,6 +379,75 @@ def width_font_glyphs(input_path: str, output_path: str, width_percent: float) -
     except Exception as e:
         logger.error(f"Error width-adjusting font {input_path}: {str(e)}")
         return False
+
+
+def _apply_horizontal_transform_truetype(font: TTFont, transform: tuple) -> None:
+    """Apply an affine transform to all TrueType glyphs (horizontal-only).
+
+    Uses fontTools.pens.transformPen.TransformPen internally via the
+    standard glyph.draw() / getGlyphSet() API. Equivalent to scaling
+    glyph.coordinates by (transform[0], transform[3]).
+    """
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    glyf_table = font['glyf']
+    glyph_set = font.getGlyphSet()
+
+    for glyph_name in font.getGlyphOrder():
+        if glyph_name not in glyf_table:
+            continue
+        glyph = glyf_table[glyph_name]
+        if glyph.numberOfContours == 0:
+            continue
+
+        # Draw through TransformPen + TTGlyphPen
+        tt_pen = TTGlyphPen(glyph_set)
+        transform_pen = TransformPen(tt_pen, transform)
+        glyph_set[glyph_name].draw(transform_pen)
+        new_glyph = tt_pen.glyph()
+
+        # Replace the glyph in the glyf table
+        glyf_table[glyph_name] = new_glyph
+
+
+def _apply_horizontal_transform_cff(font: TTFont, transform: tuple) -> None:
+    """Apply an affine transform to all CFF charstrings (horizontal-only).
+
+    Uses fontTools.pens.transformPen.TransformPen to rewrite each
+    charstring through a T2CharStringPen. This is the canonical fontTools
+    pattern for non-uniform CFF scaling (matches the CFF path in
+    fontTools.ttLib.scaleUpem).
+    """
+    cff_key = 'CFF2' if 'CFF2' in font else 'CFF '
+    top_dict = font[cff_key].cff.topDictIndex[0]
+    char_strings = top_dict.CharStrings
+    glyph_set = font.getGlyphSet()
+    hmtx = font.get('hmtx')
+
+    # Ensure hmtx has all glyphs (long-named glyphs may be missing)
+    if hmtx is not None:
+        for gn in font.getGlyphOrder():
+            if gn not in hmtx.metrics:
+                hmtx.metrics[gn] = (0, 0)
+
+    new_charstrings = {}
+    for glyph_name in font.getGlyphOrder():
+        if glyph_name not in char_strings or glyph_name not in glyph_set:
+            continue
+        try:
+            scaled_width = int(round(hmtx.metrics[glyph_name][0] * transform[0])) \
+                if hmtx and glyph_name in hmtx.metrics else 0
+            t2_pen = T2CharStringPen(scaled_width, glyph_set)
+            transform_pen = TransformPen(t2_pen, transform)
+            glyph_set[glyph_name].draw(transform_pen)
+            new_cs = t2_pen.getCharString()
+            new_cs.private = top_dict.Private
+            new_charstrings[glyph_name] = new_cs
+        except Exception as e:
+            logger.warning(f"Could not apply width transform to '{glyph_name}': {e}")
+            new_charstrings[glyph_name] = char_strings[glyph_name]
+
+    for name, cs in new_charstrings.items():
+        char_strings[name] = cs
 
 
 # ---------------------------------------------------------------------------
@@ -1069,8 +994,7 @@ def _apply_solid_postprocess(font: TTFont, weight_offset: int) -> None:
 #  v8.2: CFF Private dict hint tuning
 # ---------------------------------------------------------------------------
 
-def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 0,
-                      scale_factor: float = 1.0) -> None:
+def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 0) -> None:
     """
     Optimise CFF Private dict for better hinting quality (v8.2 NEW).
 
@@ -1085,28 +1009,22 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
       - LanguageGroup = 1  (Latin horizontal-stem handling)
       - ExpansionFactor    (stem growth/shrink tolerance for grid-fitting)
       - BlueShift/BlueFuzz (alignment-zone matching tolerance)
-      - BlueValues         (cap-height + baseline zones, if missing)
-      - OtherBlues         (x-height + baseline zones, if missing)
+      - BlueValues         (synthesised if missing AND rebuild=True)
+      - OtherBlues         (synthesised if missing AND rebuild=True)
 
-    v8.5 BUG FIX: `--rebuild-hints` previously OVERWROTE good zones with
-    synthesised ones that had wrong widths (20 units instead of 11) and
-    fabricated descender zones. This caused bad alignment-zone matching
-    in GTK renderers (and visually wrong stem snapping).
-    The fix uses the same canonical fontTools pattern as
-    ``fontTools.ttLib.scaleUpem.scale_upem()``: getattr/setattr on the
-    PrivateDict instance, with a ScalerVisitor-style helper for scaling.
+    v8.5 REFACTOR: BlueValues/OtherBlues SCALING is now handled by
+    ``fontTools.ttLib.scaleUpem.scale_upem()`` in scale_font_glyphs().
+    This function only handles the SYNTHESIS of missing zones and the
+    canonical Private DICT defaults (LanguageGroup, ExpansionFactor, etc.).
 
     Args:
         font: The TTFont object to modify (in place).
-        rebuild: If True, also rebuild existing zones (scale or synthesise).
+        rebuild: If True, synthesise missing zones from OS/2 metrics.
+                 (Scaling of existing zones is now done by scale_upem.)
         blue_quantise: Round BlueValues/OtherBlues to N-unit grid (0=off).
-        scale_factor: Multiplier for existing zones (default 1.0=no change).
-                      Should be set to (1.0 + scale_percent/100) in the pipeline.
     """
     if 'CFF ' not in font and 'CFF2' not in font:
         return
-
-    from fontTools.misc.fixedTools import otRound
 
     cff_key = 'CFF2' if 'CFF2' in font else 'CFF '
     top_dict = font[cff_key].cff.topDictIndex[0]
@@ -1126,48 +1044,14 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
         priv.BlueShift = 7               # overshoot allowance
 
     # -------------------------------------------------------------------------
-    # --rebuild-hints: scale existing BlueValues/OtherBlues uniformly by
-    # scale_factor (the same factor used to scale the font outlines).
-    #
-    # This is the canonical fontTools CFF-scaling pattern from
-    # fontTools.ttLib.scaleUpem.ScalerVisitor.visit (visit CFF/CFF2.cff):
-    #
-    #     for private in privates:
-    #         for attr in ("BlueValues", "OtherBlues", "FamilyBlues",
-    #                      "FamilyOtherBlues", "StdHW", "StdVW",
-    #                      "StemSnapH", "StemSnapV", ...):
-    #             value = getattr(private, attr, None)
-    #             if value is None: continue
-    #             if isinstance(value, list):
-    #                 _cff_scale(visitor, value)
-    #             else:
-    #                 setattr(private, attr, visitor.scale(value))
-    #
-    # We replicate this exactly for BlueValues/OtherBlues when rebuild=True.
-    # BlueScale/BlueShift/BlueFuzz/StdHW/StdVW/StemSnap* are NOT scaled
-    # (they are unit-less ratios / pixel offsets, not font coordinates).
-    # -------------------------------------------------------------------------
-    if rebuild and scale_factor != 1.0:
-        scale = lambda v: otRound(v * scale_factor)
-        for attr in ("BlueValues", "OtherBlues", "FamilyBlues", "FamilyOtherBlues"):
-            value = getattr(priv, attr, None)
-            if value is None:
-                continue
-            new_value = [scale(v) for v in value]
-            setattr(priv, attr, new_value)
-            logger.debug(f"CFF {attr} scaled by {scale_factor}: {new_value}")
-
-    # -------------------------------------------------------------------------
     # Synthesise BlueValues/OtherBlues from OS/2 metrics when missing.
-    # Uses fontTools' own convention for zone widths: derived from UPM
-    # (typically ~11 for UPM 1000). Note: previous v8.5 logic used
-    # ``zone_w = upm/100`` doubled to 20-unit wide zones, which caused
-    # bad stem-snapping in GTK renderers. Now uses overshoot widths
-    # closer to real Latin overshoot amounts (~5-12 for UPM 1000).
+    # NOTE: Existing zones are no longer rescaled here -- that is handled
+    # by fontTools.ttLib.scaleUpem.scale_upem() in scale_font_glyphs().
+    # Uses overshoot widths derived from UPM (~11 for UPM 1000).
     # -------------------------------------------------------------------------
     has_blue = getattr(priv, 'BlueValues', None) is not None
     has_other = getattr(priv, 'OtherBlues', None) is not None
-    need_synth = (not has_blue) or (rebuild and not has_blue)
+    need_synth = rebuild and (not has_blue or not has_other)
 
     if need_synth:
         cap = 700
@@ -1219,13 +1103,12 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
                 priv.OtherBlues = ob
                 logger.debug(f"CFF OtherBlues synthesised: {priv.OtherBlues}")
 
-    # v8.5 NEW: Round BlueValues/OtherBlues/FamilyBlues to a clean N-unit grid.
+    # -------------------------------------------------------------------------
+    # --blue-quantise: Round BlueValues/OtherBlues/FamilyBlues to a clean N-unit grid.
     # Eliminates fractional values that can cause rasteriser mis-snap.
-    # --blue-quantise N: round to nearest N units (default 1 = each unit).
-    #   0 disables quantisation. Common values: 1 (each unit), 2, 4, 8.
     # Uses the canonical fontTools getattr/setattr pattern (matching
-    # fontTools.cffLib.transforms.remove_hints() and
-    # fontTools.ttLib.scaleUpem.ScalerVisitor.visit()).
+    # fontTools.cffLib.transforms.remove_hints()).
+    # -------------------------------------------------------------------------
     if blue_quantise and blue_quantise > 0:
         for attr in ('BlueValues', 'OtherBlues', 'FamilyBlues', 'FamilyOtherBlues'):
             vals = getattr(priv, attr, None)
@@ -1235,7 +1118,6 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
                 logger.debug(f"CFF {attr} quantised to {blue_quantise}-unit grid: {quantised}")
 
     logger.debug("CFF hint tuning applied: LanguageGroup, ExpansionFactor, BlueValues")
-
 
 # ---------------------------------------------------------------------------
 #  v8.2: TrueType outline cleanup (collinear / near-duplicate removal)
@@ -1837,8 +1719,7 @@ def _apply_clear_shaping_postprocess(font_path: str, options: dict) -> bool:
         # This is THE highest-impact v8.2 improvement for OTF fonts.
         if options.get('hint_tune'):
             _tune_cff_hinting(font, rebuild=options.get('rebuild_hints', False),
-                               blue_quantise=options.get('blue_quantise', 0),
-                               scale_factor=options.get('_tune_scale_factor', 1.0))
+                               blue_quantise=options.get('blue_quantise', 0))
             # Subpixel coordinate snapping (both TT and CFF)
             _snap_to_integer(font)
             # Stem width normalisation
@@ -1943,27 +1824,26 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
             return False
 
         # ------------------------------------------------------------------
-        # Step 3 — (v8.3 NEW) Pre-hint: rebuild stale BlueValues
-        # Must happen BEFORE psautohint so it generates hints based on
-        # the corrected alignment zones.
+        # Step 3 — (v8.5) Pre-hint: synthesise BlueValues/OtherBlues from
+        # OS/2 metrics if they're missing.
+        #
+        # v8.5 REFACTOR: scale_upem() in scale_font_glyphs() already scaled
+        # BlueValues to match the scaled outlines. So the SCALING part of
+        # --rebuild-hints is no longer needed here. What remains is the
+        # SYNTHESIS of missing zones from OS/2 metrics (for fonts that
+        # ship without alignment zones, common with Samsung/Google fonts).
         # ------------------------------------------------------------------
         rebuild = options.get('rebuild_hints', False) and font_info['is_cff']
         if rebuild:
             try:
                 tmp = TTFont(actual_input)
-                # v8.5 BUG FIX: Pass the scale factor so BlueValues are
-                # scaled uniformly (not synthesised from scratch).
-                _tune_scale = 1.0 + (options.get('scale_percent', 0) / 100.0)
-                # Apply width to Y (vertical metrics) too if --width used.
-                # Actually --width is X-only, so vertical BlueValues use scale only.
                 _tune_cff_hinting(tmp, rebuild=True,
-                                  blue_quantise=options.get('blue_quantise', 0),
-                                  scale_factor=_tune_scale)
+                                  blue_quantise=options.get('blue_quantise', 0))
                 tmp.save(actual_input)
                 tmp.close()
-                logger.debug("BlueValues rebuilt before psautohint")
+                logger.debug("Missing BlueValues synthesised from OS/2 metrics")
             except Exception as e:
-                logger.warning(f"Pre-hint BlueValues rebuild failed: {e}")
+                logger.warning(f"Pre-hint BlueValues synthesis failed: {e}")
 
         # ------------------------------------------------------------------
         # Step 4 — Hint optimisation
