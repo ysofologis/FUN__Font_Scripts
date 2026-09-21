@@ -686,6 +686,7 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
                     logger.info(f"Autohinted (TrueType via foundrytools)")
                 elif font.is_ps:
                     try:
+                        _patch_afdko_logging()  # Fix AFDKO multiprocessing logging bug
                         from foundrytools.app.otf_autohint import run as otf_autohint
                         otf_autohint(font, allowChanges=True, hintAll=True)
                         logger.info(f"Autohinted (CFF via foundrytools)")
@@ -719,6 +720,41 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
         logger.error(f"Error optimizing {input_path}: {e}")
         logger.debug(traceback.format_exc())
         return False
+
+
+def _patch_afdko_logging() -> None:
+    """
+    Patch AFDKO's otfautohint logging to handle missing custom attributes.
+
+    AFDKO's otfautohint uses a custom log record factory that adds
+    ``glyph``, ``instance``, and ``dimension`` attributes. However, when
+    records are sent across process boundaries (multiprocessing) via a
+    QueueHandler, the log record factory does NOT run again, so the
+    attributes are missing. The custom formatter then crashes with::
+
+        AttributeError: 'LogRecord' object has no attribute 'dimension'
+
+    This patch monkey-patches the formatter to use ``getattr(record, attr,
+    '')`` so missing attributes default to empty string. Idempotent.
+    """
+    try:
+        from afdko.otfautohint.logging import otfautoLogFormatter
+        original_format = otfautoLogFormatter.format
+
+        def patched_format(self, record):
+            # Ensure custom attributes exist with sensible defaults
+            for attr in ('glyph', 'instance', 'dimension'):
+                if not hasattr(record, attr):
+                    setattr(record, attr, '')
+            return original_format(self, record)
+
+        otfautoLogFormatter.format = patched_format
+        logger.debug("Patched AFDKO otfautohint logging for missing attributes")
+    except ImportError:
+        # AFDKO not installed; nothing to patch
+        pass
+    except Exception as e:
+        logger.debug(f"Failed to patch AFDKO logging: {e}")
 
 
 def _psautohint_fallback(font: Font) -> None:
