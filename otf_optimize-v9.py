@@ -817,7 +817,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # --- Scaling ---
     parser.add_argument('--scale', type=float, default=0, dest='scale_percent',
-                        help='[v9] Scale font by UPM change. Same value semantics as v8.5.')
+                        help='[v9] Scale font by UPM change. '
+                             'Semantics: |value| >= 1.0 -> percentage (e.g. 30 = +30%%, '
+                             'makes the font 1.3x bigger); '
+                             '|value| < 1.0 -> direct multiplier (e.g. 0.5 = 50%% size). '
+                             'Common values: 5, 10, 30, 50. Capped at [0.10x, 4.00x].')
     parser.add_argument('--width', type=float, default=0, dest='width_percent',
                         help='[v9] Adjust horizontal width only. Positive = expand, negative = condense.')
     parser.add_argument('--expand', type=float, default=None, dest='expand_percent',
