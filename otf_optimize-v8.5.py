@@ -1069,7 +1069,8 @@ def _apply_solid_postprocess(font: TTFont, weight_offset: int) -> None:
 #  v8.2: CFF Private dict hint tuning
 # ---------------------------------------------------------------------------
 
-def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 0) -> None:
+def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 0,
+                      scale_factor: float = 1.0) -> None:
     """
     Optimise CFF Private dict for better hinting quality (v8.2 NEW).
 
@@ -1086,6 +1087,25 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
       - BlueShift/BlueFuzz (alignment-zone matching tolerance)
       - BlueValues         (cap-height + baseline zones, if missing)
       - OtherBlues         (x-height + baseline zones, if missing)
+
+    v8.5 BUG FIX: `--rebuild-hints` previously OVERWROTE good zones with
+    synthesised ones that had wrong widths (20 units instead of 11) and
+    fabricated descender zones. This caused bad alignment-zone matching
+    in GTK renderers (and visually wrong stem snapping).
+    The fix:
+      - rebuild=True with existing zones: SCALE uniformly by `scale_factor`,
+        preserving zone structure and widths (just shifting positions to
+        match the scaled outlines). Pass scale_factor=1.0 + (scale_percent/100).
+      - rebuild=True without zones: synthesise from OS/2 with REAL overshoot
+        widths (~11 for UPM 1000), not the previously-too-wide 20.
+      - rebuild=False: only synthesise if missing.
+
+    Args:
+        font: The TTFont object to modify (in place).
+        rebuild: If True, also rebuild existing zones (scale or synthesise).
+        blue_quantise: Round BlueValues/OtherBlues to N-unit grid (0=off).
+        scale_factor: Multiplier for existing zones (default 1.0=no change).
+                      Should be set to (1.0 + scale_percent/100) in the pipeline.
     """
     if 'CFF ' not in font and 'CFF2' not in font:
         return
@@ -1094,7 +1114,7 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
     top_dict = font[cff_key].cff.topDictIndex[0]
     priv = top_dict.Private
 
-    # LanguageGroup 1 = Latin (different horizontal-stem hinting path)
+    # LanguageGroup 1 = Latin (different horizontal-stem handling)
     if not priv.LanguageGroup:
         priv.LanguageGroup = 1
 
@@ -1119,8 +1139,18 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
     has_blue = priv.rawDict.get('BlueValues')
     has_other = priv.rawDict.get('OtherBlues')
 
-    # Synthesise if missing OR if rebuild=True (to fix hint drift after scaling)
-    need_synth = rebuild or not has_blue or not has_other
+    if rebuild and has_blue and scale_factor != 1.0:
+        # v8.5 BUG FIX: Scale existing zones uniformly. This preserves
+        # zone structure (each pair's relative width and position) while
+        # shifting absolute positions to match scaled outlines.
+        # Previous behaviour overwrote good zones with synthesised wider ones.
+        priv.BlueValues = [int(round(v * scale_factor)) for v in has_blue]
+        logger.debug(f"CFF BlueValues scaled by {scale_factor}: {priv.BlueValues}")
+        if has_other:
+            priv.OtherBlues = [int(round(v * scale_factor)) for v in has_other]
+            logger.debug(f"CFF OtherBlues scaled by {scale_factor}: {priv.OtherBlues}")
+
+    need_synth = (not has_blue) or (rebuild and not has_blue)
 
     if need_synth:
         cap = 700
@@ -1137,39 +1167,50 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
                 desc = os2.sTypoDescender
         head = font.get('head')
         if head:
-            upem = head.unitsPerEm or 1000
+            upm = head.unitsPerEm or 1000
             if not (os2 and os2.sCapHeight):
-                cap = int(upem * 0.7)
+                cap = int(upm * 0.7)
             if not (os2 and os2.sxHeight):
-                xh = int(upem * 0.5)
-        # Zone width scales with UPM (~10 for UPM 1000)
-        zone_w = max(1, int(round(upem / 100.0)))
+                xh = int(upm * 0.5)
 
-        if rebuild or not has_blue:
-            # v8.5 IMPROVED: synthesise proper 4-zone BlueValues:
-            # [descender zone] [baseline] [x-height zone] [cap-height zone]
+        # v8.5 BUG FIX: Use REAL overshoot widths (~11 for UPM 1000), NOT
+        # arbitrary upm/100 doubled to 20. Real Latin font overshoots are
+        # typically 5-15 units for UPM 1000. The previous 20-unit wide zones
+        # caused excessive snapping in GTK renderers.
+        zone_w_baseline = max(5, int(round(upm * 0.011)))  # ~11 for UPM 1000
+        zone_w_cap = max(5, int(round(upm * 0.011)))       # ~11 for UPM 1000
+        zone_w_xh = max(7, int(round(upm * 0.011)))        # ~11 for UPM 1000
+        zone_w_desc = max(8, int(round(upm * 0.015)))      # ~15 for UPM 1000
+
+        if not has_blue:
             bv = []
-            if desc < 0:
-                bv.extend([int(desc - zone_w), int(desc)])
-            bv.extend([-zone_w, 0])
+            # Baseline zone: small overshoot around 0
+            bv.extend([-zone_w_baseline, 0])
+            # x-height zone: overshoot around xh
             if xh > 0:
-                bv.extend([int(xh - zone_w), int(xh + zone_w)])
-            if cap > 0:
-                bv.extend([int(cap - zone_w), int(cap + zone_w)])
+                bv.extend([int(xh - zone_w_xh), int(xh + zone_w_xh)])
+            # Cap-height zone: overshoot around cap (only if cap != xh)
+            if cap > 0 and cap != xh:
+                bv.extend([int(cap - zone_w_cap), int(cap + zone_w_cap)])
             bv.sort()
             priv.BlueValues = bv
-            logger.debug(f"CFF BlueValues set: {priv.BlueValues} (rebuild={rebuild})")
+            logger.debug(f"CFF BlueValues synthesised (overshoot zones): {priv.BlueValues}")
 
-        if rebuild or (not has_other and xh):
-            # v8.5 IMPROVED: OtherBlues can hold additional descender zones
+        if not has_other:
+            # OtherBlues: ONLY descender zones, ONLY if descender exists.
+            # v8.5 BUG FIX: previous logic fabricated OtherBlues at random
+            # heights when no original was present, causing bad snapping.
             ob = []
             if desc < 0:
-                ob.extend([int(desc - 2 * zone_w), int(desc - zone_w)])
+                ob.extend([int(desc - zone_w_desc), int(desc - zone_w_desc // 2)])
             if not ob:
-                ob = [xh, xh + zone_w]
-            ob.sort()
-            priv.OtherBlues = ob
-            logger.debug(f"CFF OtherBlues set: {priv.OtherBlues} (rebuild={rebuild})")
+                # No descender: use a secondary x-height zone in OtherBlues
+                if xh > 0:
+                    ob = [int(xh - zone_w_xh), int(xh + zone_w_xh)]
+            if ob:
+                ob.sort()
+                priv.OtherBlues = ob
+                logger.debug(f"CFF OtherBlues synthesised: {priv.OtherBlues}")
 
     # v8.5 NEW: Round BlueValues/OtherBlues/FamilyBlues to a clean N-unit grid.
     # Eliminates fractional values that can cause rasteriser mis-snap.
@@ -1791,7 +1832,8 @@ def _apply_clear_shaping_postprocess(font_path: str, options: dict) -> bool:
         # This is THE highest-impact v8.2 improvement for OTF fonts.
         if options.get('hint_tune'):
             _tune_cff_hinting(font, rebuild=options.get('rebuild_hints', False),
-                               blue_quantise=options.get('blue_quantise', 0))
+                               blue_quantise=options.get('blue_quantise', 0),
+                               scale_factor=options.get('_tune_scale_factor', 1.0))
             # Subpixel coordinate snapping (both TT and CFF)
             _snap_to_integer(font)
             # Stem width normalisation
@@ -1904,8 +1946,14 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
         if rebuild:
             try:
                 tmp = TTFont(actual_input)
+                # v8.5 BUG FIX: Pass the scale factor so BlueValues are
+                # scaled uniformly (not synthesised from scratch).
+                _tune_scale = 1.0 + (options.get('scale_percent', 0) / 100.0)
+                # Apply width to Y (vertical metrics) too if --width used.
+                # Actually --width is X-only, so vertical BlueValues use scale only.
                 _tune_cff_hinting(tmp, rebuild=True,
-                                  blue_quantise=options.get('blue_quantise', 0))
+                                  blue_quantise=options.get('blue_quantise', 0),
+                                  scale_factor=_tune_scale)
                 tmp.save(actual_input)
                 tmp.close()
                 logger.debug("BlueValues rebuilt before psautohint")

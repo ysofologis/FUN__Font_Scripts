@@ -475,6 +475,7 @@ All Chrome-breaking issues have been fixed:
 |---------|-------------|
 
 | **v8.5** | **Latest (fontTools + psautohint).** Added `--width/--expand/--condense` for horizontal expand/condense (independent of --scale), `--blue-quantise N` to round CFF BlueValues/OtherBlues to a clean N-unit grid, `--no-thickness` escape hatch. Improved `_tune_cff_hinting` to synthesise proper 4-zone BlueValues (descender, baseline, x-height, cap-height) with UPM-aware zone width. |
+| **v8.5 BUGFIX** | **CRITICAL: `--rebuild-hints` no longer overwrites correct zones with bad ones.** The previous logic always synthesised new zones from OS/2 metrics, replacing the font's original well-tuned BlueValues with synthesised 20-unit-wide zones plus a fabricated descender zone. This caused bad alignment-zone matching in GTK renderers (Pango/Cairo), where stems snapped to incorrect positions, producing the "thickness abnormal" / "stems not solid" appearance. The fix: when `--rebuild-hints` runs and the font already has BlueValues, **scale them uniformly** by the same factor used to scale the font (preserving zone widths and structure). When the font has no BlueValues, synthesise with proper ~11-unit-wide overshoot zones (instead of the previous too-wide 20 units). |
 
 | **v8.3** | `--thickness` reworked: per-contour inset-rescale (outer contour left/bottom preserved, inner counter shrunk → stems thicker, advance widths unchanged). Also shrank the outer contour, making glyphs look smaller. A subsequent v8.4 attempt with radial dilation caused uneven curve thickening and was removed; FontForge-based v2.1 is recommended for proper thickening via FontForge's changeWeight. |
 
@@ -647,6 +648,22 @@ Add `--thickness 5` to `--thickness 15` to thicken vertical stems. Combine with 
 ### Fonts hint poorly (especially Samsung-style fonts)
 
 Add `--hint-tune`. Many foundry fonts ship without `BlueValues`, which means psautohint has nothing to align to. `--hint-tune` synthesises alignment zones from OS/2 `sxHeight` and `sCapHeight`. **Combined with `--rebuild-hints`** to also fix hint drift after scaling.
+
+
+
+### Stems look thick/abnormal in GTK but OK in KDE (v8.5 BUGFIX)
+
+**Symptom:** Font renders correctly in KDE/Qt apps but stems appear uneven, abnormally thick, or "not solid" in GTK apps (Pango/Cairo-based renderers like GNOME apps, Firefox GTK, GIMP, etc.).
+
+**Cause:** v8.5's previous `--rebuild-hints` logic overwrote the font's original well-tuned `BlueValues` with synthesised ones that had zone widths of 20 units (way too wide for UPM 1000) and a fabricated descender zone at the wrong position. CFF renderers that strictly honour `BlueValues` (GTK/Pango through FreeType) snap stems to these wrong zones, while KDE/Qt's hint engine is more forgiving.
+
+**Fix:** The bug has been fixed in v8.5. `--rebuild-hints` now:
+
+- When font already has BlueValues: **scales them uniformly** by the same factor used to scale the font (preserves structure and zone widths).
+- When font has no BlueValues: synthesises with proper ~11-unit-wide overshoot zones (instead of too-wide 20 units).
+- Never fabricates a descender zone unless the original font had one or `sTypoDescender` exists.
+
+If you have an old v8.5 output affected by this bug, re-run with the same command to get the fixed output.
 
 
 
