@@ -31,7 +31,7 @@ This directory contains Python scripts for improving OTF/TTF font rendering qual
 
 | `otf_optimize_ff-v2.1.py` | **Latest (FontForge-based):** Single-tool dependency (FontForge), fontTools for post-processing. Has proper --thickness via FontForge changeWeight. |
 
-| `otf_optimize-v9.py` | **Latest (foundrytools-based):** Uses `foundrytools` library (https://foundrytools.readthedocs.io) for canonical APIs. 892 lines (vs 2314 for v8.5). Adds StdHW/StdVW/StemSnap* recalculation from real stem widths, contour correction via skia-pathops, and `set_production_names`. |
+| `otf_optimize-v9.py` | **Latest (foundrytools-based):** Uses `foundrytools` library (https://foundrytools.readthedocs.io) for canonical APIs. 892 lines (vs 2314 for v8.5). Adds StdHW/StdVW/StemSnap* recalculation from real stem widths, contour correction via skia-pathops, and `set_production_names`. **Direct-multiplier `--scale` semantics**: `1.0` = no change, `1.5` = 1.5x bigger, `0.5` = 0.5x smaller. |
 
 | `otf_optimize-v8.5.py` | **Previous (fontTools + psautohint):** Best CFF hint quality (uses external psautohint). Adds --width/--expand/--condense and --blue-quantise over v8.3. |
 

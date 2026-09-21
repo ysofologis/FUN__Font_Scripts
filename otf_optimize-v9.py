@@ -564,46 +564,54 @@ def _apply_horizontal_transform_cff(font: Font, transform: tuple) -> None:
 #  v9: Scale by UPM change (using foundrytools' canonical API)
 # ---------------------------------------------------------------------------
 
-def scale_upm(font: Font, scale_percent: float) -> None:
+def scale_upm(font: Font, scale: float) -> None:
     """
     Scale font by UPM change (delegates to foundrytools' canonical API).
 
-    This is the canonical fontTools pattern for font scaling: change unitsPerEm
-    to new_upem, which scales ALL coordinates uniformly. Preserves CFF
-    BlueValues/OtherBlues/StdHW/StdVW/StemSnap* and all OS/2 metrics.
+    Direct multiplier semantics (unambiguous):
+      - scale 1.0  -> no change (1.0x = original size)
+      - scale 1.5  -> 1.5x bigger
+      - scale 0.5  -> 0.5x smaller (half size)
+      - scale 2.0  -> 2x bigger
+      - scale 0.1  -> 0.1x (10% size)
 
-    scale_percent:
-      - |value| < 1.0  → direct multiplier (e.g. 0.5 = 50% size)
-      - |value| >= 1.0 → percentage change (e.g. 5 = +5%)
+    Safety caps: [0.10x, 4.00x] to prevent accidental extremes.
+
+    Implementation: change unitsPerEm to new_upem, which scales ALL
+    coordinates uniformly. This is the canonical fontTools pattern (used
+    by fontTools.ttLib.scaleUpem.scale_upem, which foundrytools wraps).
+
+    Note: This changes the font's INTERNAL design grid. When the font is
+    rendered at the SAME point size, the glyphs appear larger/smaller
+    because the font's em-square is now bigger/smaller.
     """
-    scale_abs = abs(scale_percent)
-    if 0 < scale_abs < 1.0:
-        scale_factor = scale_percent
-    elif scale_abs >= 1.0:
-        scale_factor = 1.0 + scale_percent / 100.0
-    else:
-        return  # No scaling needed
+    if scale <= 0:
+        return  # No scaling for 0 or negative
 
-    # Safety caps
-    if scale_factor < 0.10:
-        scale_factor = 0.10
-    elif scale_factor > 4.00:
-        scale_factor = 4.00
+    # Apply safety caps
+    if scale < 0.10:
+        logger.warning(f"Scale {scale} below minimum (0.10), clamping to 0.10")
+        scale = 0.10
+    elif scale > 4.00:
+        logger.warning(f"Scale {scale} above maximum (4.00), clamping to 4.00")
+        scale = 4.00
 
-    # foundrytools.Font.scale_upm only takes integer target_upm
-    new_upm = int(round(font.t_head.units_per_em * scale_factor))
+    current_upm = font.t_head.units_per_em
+    new_upm = int(round(current_upm * scale))
     new_upm = max(MIN_UPM, min(MAX_UPM, new_upm))
 
-    if new_upm == font.t_head.units_per_em:
+    if new_upm == current_upm:
+        if scale == 1.0:
+            logger.debug("Scale 1.0 = no change, skipping")
+        else:
+            logger.debug(f"Scale {scale} rounds to same upm ({new_upm}), skipping")
         return
 
+    logger.info(f"Scaling font: {scale}x (upem {current_upm} -> {new_upm})")
     font.scale_upm(new_upm)
-    logger.debug(f"Scaled via foundrytools.scale_upm to upm={new_upm}")
 
 
-# ---------------------------------------------------------------------------
-#  v9: Main pipeline (using foundrytools throughout)
-# ---------------------------------------------------------------------------
+
 
 def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
     """
@@ -817,11 +825,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # --- Scaling ---
     parser.add_argument('--scale', type=float, default=0, dest='scale_percent',
-                        help='[v9] Scale font by UPM change. '
-                             'Semantics: |value| >= 1.0 -> percentage (e.g. 30 = +30%%, '
-                             'makes the font 1.3x bigger); '
-                             '|value| < 1.0 -> direct multiplier (e.g. 0.5 = 50%% size). '
-                             'Common values: 5, 10, 30, 50. Capped at [0.10x, 4.00x].')
+                        help='[v9] Scale font by UPM change. Direct multiplier: '
+                             'scale 1.0 = no change; 1.5 = 1.5x bigger; 0.5 = 0.5x smaller. '
+                             'Capped at [0.10x, 4.00x].')
     parser.add_argument('--width', type=float, default=0, dest='width_percent',
                         help='[v9] Adjust horizontal width only. Positive = expand, negative = condense.')
     parser.add_argument('--expand', type=float, default=None, dest='expand_percent',
