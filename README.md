@@ -31,7 +31,9 @@ This directory contains Python scripts for improving OTF/TTF font rendering qual
 
 | `otf_optimize_ff-v2.1.py` | **Latest (FontForge-based):** Single-tool dependency (FontForge), fontTools for post-processing. Has proper --thickness via FontForge changeWeight. |
 
-| `otf_optimize-v8.5.py` | **Latest (fontTools + psautohint):** Best CFF hint quality (uses external psautohint). Adds --width/--expand/--condense and --blue-quantise over v8.3. |
+| `otf_optimize-v9.py` | **Latest (foundrytools-based):** Uses `foundrytools` library (https://foundrytools.readthedocs.io) for canonical APIs. 892 lines (vs 2314 for v8.5). Adds StdHW/StdVW/StemSnap* recalculation from real stem widths, contour correction via skia-pathops, and `set_production_names`. |
+
+| `otf_optimize-v8.5.py` | **Previous (fontTools + psautohint):** Best CFF hint quality (uses external psautohint). Adds --width/--expand/--condense and --blue-quantise over v8.3. |
 
 | `otf_optimize-v8.3.py` | Previous version with inset-rescale --thickness. FontForge v2.1 recommended for thickening. |
 
@@ -476,6 +478,7 @@ All Chrome-breaking issues have been fixed:
 
 | **v8.5** | **Latest (fontTools + psautohint).** Added `--width/--expand/--condense` for horizontal expand/condense (independent of --scale), `--blue-quantise N` to round CFF BlueValues/OtherBlues to a clean N-unit grid, `--no-thickness` escape hatch. Improved `_tune_cff_hinting` to synthesise proper 4-zone BlueValues (descender, baseline, x-height, cap-height) with UPM-aware zone width. |
 | **v8.5 BUGFIX** | **CRITICAL: `--rebuild-hints` no longer overwrites correct zones with bad ones.** The previous logic always synthesised new zones from OS/2 metrics, replacing the font's original well-tuned BlueValues with synthesised 20-unit-wide zones plus a fabricated descender zone. This caused bad alignment-zone matching in GTK renderers (Pango/Cairo), where stems snapped to incorrect positions, producing the "thickness abnormal" / "stems not solid" appearance. The fix: when `--rebuild-hints` runs and the font already has BlueValues, **scale them uniformly** by the same factor used to scale the font (preserving zone widths and structure). When the font has no BlueValues, synthesise with proper ~11-unit-wide overshoot zones (instead of the previous too-wide 20 units). |
+| **v9** | **NEW GENERATION: foundrytools-based.** Complete rewrite using `foundrytools` library. 892 lines (vs 2314 for v8.5, ~62% reduction). Uses canonical foundrytools APIs: `Font.scale_upm`, `Font.correct_contours`, `Font.set_production_names`, `app.otf_recalc_zones`, `app.otf_recalc_stems`, `app.otf_autohint`, `app.ttf_autohint`. New features: real stem-width recalculation (StdHW/StdVW/StemSnap*), contour overlap removal via skia-pathops, `set_production_names`. Preserves all v8.5 features. |
 
 | **v8.3** | `--thickness` reworked: per-contour inset-rescale (outer contour left/bottom preserved, inner counter shrunk → stems thicker, advance widths unchanged). Also shrank the outer contour, making glyphs look smaller. A subsequent v8.4 attempt with radial dilation caused uneven curve thickening and was removed; FontForge-based v2.1 is recommended for proper thickening via FontForge's changeWeight. |
 
