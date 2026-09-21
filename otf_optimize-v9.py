@@ -847,6 +847,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--pixel-snap', type=int, default=0, dest='pixel_snap',
                         help='[v9] Round CFF coordinates to integers (0=disable).')
 
+    # --- v8.5 backward-compatibility aliases (no-op or mapped) ---
+    # These flags were accepted by v8.5 but were either redundant in v9
+    # (now enabled by default) or no longer apply. They are accepted
+    # silently so old commands work without "unrecognized argument" errors.
+    parser.add_argument('--solid', action='store_true', default=False, dest='solid_legacy',
+                        help=argparse.SUPPRESS)  # v8.5: enable solid mode (now always on)
+    parser.add_argument('--clear-shaping', action='store_true', default=False, dest='clear_shaping',
+                        help=argparse.SUPPRESS)  # v8.5: enable clear-shaping (now always on)
+    parser.add_argument('--no-overlap-remove', action='store_true', default=False, dest='no_overlap_remove',
+                        help=argparse.SUPPRESS)  # v8.5: skip overlap removal (no-op in v9)
+    parser.add_argument('--no-stem-round', action='store_true', default=False, dest='no_stem_round',
+                        help=argparse.SUPPRESS)  # v8.5: skip stem rounding (no-op in v9)
+    parser.add_argument('--no-flex', action='store_true', default=False, dest='no_flex',
+                        help=argparse.SUPPRESS)  # v8.5: psautohint --no-flex
+    parser.add_argument('--no-hint-sub', action='store_true', default=False, dest='no_hint_sub',
+                        help=argparse.SUPPRESS)  # v8.5: psautohint --no-hint-sub
+    parser.add_argument('--allow-changes', action='store_true', default=False, dest='allow_changes',
+                        help=argparse.SUPPRESS)  # v8.5: psautohint -c
+    parser.add_argument('--dropout-control', action='store_true', default=False, dest='dropout_control',
+                        help=argparse.SUPPRESS)  # v8.5: TrueType dropout control
+    parser.add_argument('--hinting-range-min', type=int, default=0, dest='hinting_range_min',
+                        help=argparse.SUPPRESS)  # v8.5: min ppem for hinting
+    parser.add_argument('--hinting-range-max', type=int, default=0, dest='hinting_range_max',
+                        help=argparse.SUPPRESS)  # v8.5: max ppem for hinting
+    parser.add_argument('--gasp-mode', type=str, default=None, dest='gasp_mode',
+                        help=argparse.SUPPRESS)  # v8.5: detailed/simple GASP
+    parser.add_argument('--pixel-gasp', action='store_true', default=False, dest='pixel_gasp',
+                        help=argparse.SUPPRESS)  # v8.5: pixel-aligned GASP
+    parser.add_argument('--x-height-hint', type=int, default=0, dest='x_height_hint',
+                        help=argparse.SUPPRESS)  # v8.5: x-height increase %
+    parser.add_argument('--strength', type=int, default=0, dest='strength',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint strength
+    parser.add_argument('--detailed', action='store_true', default=False, dest='detailed',
+                        help=argparse.SUPPRESS)  # v8.5: detailed TTF instructions
+    parser.add_argument('--stem-width', type=int, default=0, dest='stem_width',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint stem width
+    parser.add_argument('--no-combining', action='store_true', default=False, dest='no_combining',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint no combining
+    parser.add_argument('--x-height-snap-exceptions', type=str, default=None, dest='x_height_snap_exceptions',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint x-height-snap-exceptions
+
     # --- GASP ---
     parser.add_argument('--gasp-detail', type=str, default='aggressive', dest='gasp_detail',
                         choices=['minimal', 'balanced', 'aggressive', 'pixel'],
