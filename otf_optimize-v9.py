@@ -450,35 +450,76 @@ def _thicken_cff_glyphs(font: Font, thickness: float) -> None:
             # Skia's stroke always outsets, so for thinning we use a different
             # approach: shrink the path by (1-thickness) amount.
             if thickness < 1.0:
-                # Thinning: subtract the stroke from the path
-                # Path minus stroke = inset version
-                # Use DIFFERENCE operation: original - (original stroked)
-                stroked = skia.Path()
-                paint.getFillPath(path, stroked, None, 1.0)
-                # Compute difference (original - stroked_outline)
-                # Skia op requires Canvas, use PathOps differently
-                # Actually, use PathMeasure or simpler approach: reverse path
-                # For now, fall back to affine inset for thinning
+                # Thinning: Skia's stroke always expands outward (no inset API).
+                # For thinning we need to shrink each segment perpendicular to
+                # itself. Skia doesn't expose a direct "inset" operation, so
+                # we use the affine-inset fallback (scale around contour center).
+                # This preserves pixel density (no sub-pixel coords) and keeps
+                # the outer contour roughly fixed.
                 logger.debug(f"Thinning case - using affine inset fallback")
-                # Compute bounds for inset
-                bounds = path.getBounds()
-                inset = stroke_width
-                # Inset by stroke_width on each side (this is approximation)
-                new_path = skia.Path()
-                cx = (bounds.left() + bounds.right()) / 2
-                cy = (bounds.top() + bounds.bottom()) / 2
-                # Scale around center
-                scale_x = max(0.1, (bounds.width() - 2*inset) / bounds.width())
-                scale_y = max(0.1, (bounds.height() - 2*inset) / bounds.height())
-                tx = cx - cx * scale_x
-                ty = cy - cy * scale_y
-                matrix = skia.Matrix.MakeAll(scale_x, 0, tx, 0, scale_y, ty, 0, 0, 1)
-                path.transform(matrix)
-                result_path = path
+                # For each contour, scale it toward its centroid
+                # Walk the contours in the result_path
+                # We'll rebuild path by transforming each contour
+                result_path = skia.Path()
+                current_contour = []
+                Verb = skia.Path.Verb
+                for verb, pts in path:
+                    if verb == Verb.kMove_Verb:
+                        current_contour = [(float(pts[0].x()), float(pts[0].y()))]
+                    elif verb == Verb.kLine_Verb:
+                        current_contour.append((float(pts[0].x()), float(pts[0].y())))
+                    elif verb == Verb.kCubic_Verb:
+                        current_contour.append((float(pts[0].x()), float(pts[0].y())))
+                        current_contour.append((float(pts[1].x()), float(pts[1].y())))
+                        current_contour.append((float(pts[2].x()), float(pts[2].y())))
+                    elif verb == Verb.kClose_Verb:
+                        # End of contour - scale toward centroid
+                        if current_contour:
+                            cx = sum(p[0] for p in current_contour) / len(current_contour)
+                            cy = sum(p[1] for p in current_contour) / len(current_contour)
+                            # Scale factor: thickness < 1 means shrink
+                            # For uniform thinning by 'amount', we shrink each contour by 'amount'
+                            # amount here is stroke_width (the value we want to remove from each side)
+                            shrink = stroke_width / 2.0  # shrink by half-stroke from center
+                            # Compute bounding box of contour
+                            xs = [p[0] for p in current_contour]
+                            ys = [p[1] for p in current_contour]
+                            w = max(xs) - min(xs)
+                            h = max(ys) - min(ys)
+                            if w > 0 and h > 0:
+                                # Scale: (W - 2*shrink) / W  on each axis
+                                scale_x = max(0.01, (w - 2*shrink) / w)
+                                scale_y = max(0.01, (h - 2*shrink) / h)
+                            else:
+                                scale_x = scale_y = 1.0
+                            
+                            # Apply transform: scale around centroid
+                            tx = cx * (1 - scale_x)
+                            ty = cy * (1 - scale_y)
+                            
+                            # Re-emit the contour
+                            for i, (px, py) in enumerate(current_contour):
+                                new_x = px * scale_x + tx
+                                new_y = py * scale_y + ty
+                                if i == 0:
+                                    result_path.moveTo(new_x, new_y)
+                                elif i < len(current_contour) - 1:
+                                    result_path.lineTo(new_x, new_y)
+                                # Last point is duplicate of first (close)
+                            result_path.close()
+                            current_contour = []
             else:
                 # Thickening: use skia's perpendicular offset
-                result_path = skia.Path()
-                paint.getFillPath(path, result_path, None, 1.0)
+                # CRITICAL: skia's stroke alone gives just the "ring" (donut)
+                # around the original path, NOT the offset/solid thickened
+                # shape. We need to UNION the stroke with the original path
+                # to get a solid filled expanded outline.
+                stroked_path = skia.Path()
+                paint.getFillPath(path, stroked_path, None, 1.0)
+                builder = skia.OpBuilder()
+                builder.add(path, skia.PathOp.kUnion_PathOp)
+                builder.add(stroked_path, skia.PathOp.kUnion_PathOp)
+                result_path = builder.resolve()
 
             # Convert skia path back to T2 charstring via pen
             scaled_width = glyph_set[glyph_name].width
@@ -610,9 +651,13 @@ def _thicken_truetype_glyphs(font: Font, thickness: float) -> None:
                 elif cmd == 'closePath':
                     path.close()
 
-            # Compute offset
-            result_path = skia.Path()
-            paint.getFillPath(path, result_path, None, 1.0)
+            # Compute offset (UNION stroke with original to get solid thickened shape)
+            stroked_path = skia.Path()
+            paint.getFillPath(path, stroked_path, None, 1.0)
+            builder = skia.OpBuilder()
+            builder.add(path, skia.PathOp.kUnion_PathOp)
+            builder.add(stroked_path, skia.PathOp.kUnion_PathOp)
+            result_path = builder.resolve()
 
             # Convert skia path to TrueType coords
             Verb = skia.Path.Verb
