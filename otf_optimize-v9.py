@@ -412,14 +412,30 @@ def _thicken_cff_glyphs(font: Font, thickness_percent: float) -> None:
         if glyph_name not in char_strings or glyph_name not in glyph_set:
             continue
         try:
-            # Compute glyph bounding box
-            bounds = font.get_glyph_bounds(glyph_name)
-            if not bounds:
+            # Compute glyph bounding box.
+            # NOTE: foundrytools.Font.get_glyph_bounds() returns a TypedDict
+            # (dict subclass) with keys 'x_min', 'y_min', 'x_max', 'y_max' --
+            # NOT a tuple. Earlier code assumed tuple unpacking, causing 656
+            # warnings for a 656-glyph font. Fixed to use dict-style access.
+            # Some glyphs (.notdef, 'space', etc.) have NO contours and
+            # get_glyph_bounds raises TypeError on None bounds.
+            try:
+                bounds = font.get_glyph_bounds(glyph_name)
+            except (TypeError, AttributeError):
+                # No contours (e.g. .notdef, space) - keep unchanged
+                new_charstrings[glyph_name] = char_strings[glyph_name]
                 continue
-            xmin, ymin, xmax, ymax = bounds
+            if not bounds:
+                new_charstrings[glyph_name] = char_strings[glyph_name]
+                continue
+            xmin = bounds['x_min']
+            ymin = bounds['y_min']
+            xmax = bounds['x_max']
+            ymax = bounds['y_max']
             W = xmax - xmin
             H = ymax - ymin
             if W <= 0 or H <= 0:
+                new_charstrings[glyph_name] = char_strings[glyph_name]
                 continue
             dx = thickness_percent * W / 100.0
             dy = thickness_percent * H / 200.0
