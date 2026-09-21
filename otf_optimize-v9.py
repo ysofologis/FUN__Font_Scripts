@@ -300,32 +300,48 @@ def _tune_cff_hinting(font: Font, rebuild: bool = False, blue_quantise: int = 0)
 #  v9: Stem thickening (custom - no foundrytools equivalent)
 # ---------------------------------------------------------------------------
 
-def _thicken_font_glyphs(font: Font, thickness_percent: float) -> None:
+def _thicken_font_glyphs(font: Font, thickness: float) -> None:
     """
     Thicken glyph stems WITHOUT changing overall font size or advance widths.
 
+    Direct multiplier semantics (unambiguous):
+      - thickness 1.0  -> no change (as-is)
+      - thickness 1.1  -> 10%% thicker
+      - thickness 1.25 -> 25%% thicker
+      - thickness 0.9  -> 10%% thinner
+      - thickness 2.0  -> 2x thicker
+      - thickness 0.5  -> half as thick
+
     Uses the inset-rescale technique (no foundrytools equivalent):
-      - Compute each glyph's bounding box (W × H).
-      - Compute horizontal stem grow dx = thickness_percent * W / 100.
-      - Apply per-glyph transform that shrinks inner counter while keeping
-        outer contour at original position.
-      - Result: stems appear thicker but font dimensions unchanged.
+      - Compute each glyph's bounding box (W x H).
+      - The inner counter is scaled by 1/thickness horizontally and
+        vertically, then offset so outer contour stays at original position.
 
     For CFF: uses fontTools TransformPen + T2CharStringPen
     For TrueType: uses TransformPen + TTGlyphPen
     """
-    if thickness_percent <= 0:
+    if thickness <= 0 or thickness == 1.0:
         return
 
-    logger.info(f"Thickening stems by {thickness_percent:+.2f}%")
+    # Apply safety caps
+    if thickness < 0.10:
+        logger.warning(f"Thickness {thickness} below minimum (0.10), clamping to 0.10")
+        thickness = 0.10
+    elif thickness > 4.00:
+        logger.warning(f"Thickness {thickness} above maximum (4.00), clamping to 4.00")
+        thickness = 4.00
+
+    pct_change = (thickness - 1.0) * 100.0  # For logging
+    logger.info(f"Thickening stems by {pct_change:+.2f}%% (multiplier {thickness}x)")
 
     if font.is_ps:
-        _thicken_cff_glyphs(font, thickness_percent)
+        _thicken_cff_glyphs(font, thickness)
     elif font.is_tt:
-        _thicken_truetype_glyphs(font, thickness_percent)
+        _thicken_truetype_glyphs(font, thickness)
 
 
-def _thicken_truetype_glyphs(font: Font, thickness_percent: float) -> None:
+
+def _thicken_truetype_glyphs(font: Font, thickness: float) -> None:
     """Thicken TrueType outlines per-contour using inset-rescale."""
     from fontTools.pens.ttGlyphPen import TTGlyphPen
     from fontTools.pens.transformPen import TransformPen
@@ -350,8 +366,11 @@ def _thicken_truetype_glyphs(font: Font, thickness_percent: float) -> None:
         H = ymax_g - ymin_g
         if W <= 0 or H <= 0:
             continue
-        dx = max(0.0, thickness_percent * W / 100.0)
-        dy = max(0.0, thickness_percent * H / 200.0)
+        # Multiplier semantics: dx = (thickness - 1) * W (10% thicker means 10% of W)
+        # Note: thickness < 1 (thinner) means dx would be negative, which we clamp to 0
+        # (we don't have logic for un-thickening stems without growing counters)
+        dx = max(0.0, (thickness - 1.0) * W)
+        dy = max(0.0, (thickness - 1.0) * H / 2.0)
         a = max(0.0, (W - 2.0 * dx) / W)
         d = max(0.0, (H - 2.0 * dy) / H)
 
@@ -398,7 +417,7 @@ def _thicken_truetype_glyphs(font: Font, thickness_percent: float) -> None:
         glyf[glyph_name] = new_glyph
 
 
-def _thicken_cff_glyphs(font: Font, thickness_percent: float) -> None:
+def _thicken_cff_glyphs(font: Font, thickness: float) -> None:
     """Thicken CFF charstrings per-glyph using inset-rescale via TransformPen."""
     from fontTools.pens.t2CharStringPen import T2CharStringPen
     from fontTools.pens.transformPen import TransformPen
@@ -437,8 +456,9 @@ def _thicken_cff_glyphs(font: Font, thickness_percent: float) -> None:
             if W <= 0 or H <= 0:
                 new_charstrings[glyph_name] = char_strings[glyph_name]
                 continue
-            dx = thickness_percent * W / 100.0
-            dy = thickness_percent * H / 200.0
+            # Multiplier semantics: dx = (thickness - 1) * W
+            dx = max(0.0, (thickness - 1.0) * W)
+            dy = max(0.0, (thickness - 1.0) * H / 2.0)
             a = max(0.0, (W - 2.0 * dx) / W)
             d = max(0.0, (H - 2.0 * dy) / H)
 
@@ -464,26 +484,35 @@ def _thicken_cff_glyphs(font: Font, thickness_percent: float) -> None:
 #  v9: Width adjust (X-only horizontal scaling - no foundrytools equivalent)
 # ---------------------------------------------------------------------------
 
-def width_font_glyphs(font: Font, width_percent: float) -> None:
+def width_font_glyphs(font: Font, width: float) -> None:
     """
     Adjust horizontal width only (v9).
+
+    Direct multiplier semantics (unambiguous):
+      - width 1.0  -> no change (as-is)
+      - width 1.5  -> 1.5x wider
+      - width 0.92 -> 8%% narrower
+      - width 0.5  -> half width
 
     Independent of --scale and --thickness. Uses fontTools TransformPen
     to apply the (factor, 0, 0, 1, 0, 0) affine transform.
     """
-    if width_percent == 0:
+    if width <= 0 or width == 1.0:
         return
 
-    factor = 1.0 + width_percent / 100.0
-    if factor < 0.10:
-        factor = 0.10
-    elif factor > 4.00:
-        factor = 4.00
+    # Apply safety caps
+    if width < 0.10:
+        logger.warning(f"Width {width} below minimum (0.10), clamping to 0.10")
+        width = 0.10
+    elif width > 4.00:
+        logger.warning(f"Width {width} above maximum (4.00), clamping to 4.00")
+        width = 4.00
 
-    direction = "expanding" if width_percent > 0 else "condensing"
-    logger.info(f"Width adjusting ({direction} by {abs(width_percent):.2f}%, x{factor:.4f})")
+    pct_change = (width - 1.0) * 100.0
+    direction = "expanding" if width > 1.0 else "condensing"
+    logger.info(f"Width adjusting ({direction} by {pct_change:+.2f}%%, x{width:.4f})")
 
-    transform = (factor, 0, 0, 1.0, 0, 0)
+    transform = (width, 0, 0, 1.0, 0, 0)
 
     if font.is_tt:
         _apply_horizontal_transform_truetype(font, transform)
@@ -495,16 +524,16 @@ def width_font_glyphs(font: Font, width_percent: float) -> None:
     if hmtx:
         for gn in list(hmtx.metrics.keys()):
             aw, lsb = hmtx.metrics[gn]
-            hmtx.metrics[gn] = (int(round(aw * factor)), int(round(lsb * factor)))
-
+            hmtx.metrics[gn] = (int(round(aw * width)),
+                                int(round(lsb * width)))
     if 'hhea' in font.ttfont:
         hhea = font.ttfont['hhea']
-        hhea.advanceWidthMax = int(round(hhea.advanceWidthMax * factor))
+        hhea.advanceWidthMax = int(round(hhea.advanceWidthMax * width))
         for attr in ('minLeftSideBearing', 'minRightSideBearing', 'xMaxExtent'):
             if hasattr(hhea, attr):
                 v = getattr(hhea, attr)
                 if v is not None:
-                    setattr(hhea, attr, int(round(v * factor)))
+                    setattr(hhea, attr, int(round(v * width)))
 
 
 def _apply_horizontal_transform_truetype(font: Font, transform: tuple) -> None:
@@ -653,14 +682,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              'so the font renders BIGGER at the same point size '
                              '(the OS does NOT compensate). '
                              'Capped at [0.10x, 4.00x].')
-    parser.add_argument('--width', type=float, default=0, dest='width_percent',
-                        help='[v9] Adjust horizontal width only. Positive = expand, negative = condense.')
+    parser.add_argument('--width', type=float, default=1.0, dest='width_percent',
+                        help='[v9] Adjust horizontal width. Direct multiplier: '
+                             '1.0 = no change; 1.5 = 1.5x wider; 0.92 = 8%% narrower. '
+                             'Capped at [0.10x, 4.00x].')
     parser.add_argument('--expand', type=float, default=None, dest='expand_percent',
-                        help='[v9] Alias for --width with positive value.')
+                        help='[v9] Alias for --width with positive percentage (e.g. --expand 5 = 5%% wider = --width 1.05).')
     parser.add_argument('--condense', type=float, default=None, dest='condense_percent',
-                        help='[v9] Alias for --width with negative value.')
-    parser.add_argument('--thickness', type=float, default=0, dest='thickness_percent',
-                        help='[v9] Thicken stems without scaling font (inset-rescale).')
+                        help='[v9] Alias for --width with negative percentage (e.g. --condense 8 = 8%% narrower = --width 0.92).')
+    parser.add_argument('--thickness', type=float, default=1.0, dest='thickness_percent',
+                        help='[v9] Thicken stems. Direct multiplier: '
+                             '1.0 = no change; 1.1 = 10%% thicker; 0.9 = 10%% thinner. '
+                             'Capped at [0.10x, 4.00x].')
 
     # --- Hinting ---
     parser.add_argument('--autohint', action='store_true', default=True, dest='autohint',
@@ -744,18 +777,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def resolve_width(args) -> float:
-    """Resolve --width/--expand/--condense aliases to a single signed value."""
-    values = []
-    if args.width_percent:
-        values.append(args.width_percent)
+    """Resolve --width/--expand/--condense aliases to a single multiplier.
+
+    All three return a multiplier (1.0 = no change):
+      --width N         -> multiplier N directly
+      --expand P        -> multiplier (1 + P/100) - percentage alias
+      --condense P      -> multiplier (1 - P/100) - percentage alias
+    """
+    n = 0
+    if args.width_percent != 1.0:  # user explicitly set --width
+        n = 1
+        val = args.width_percent
     if args.expand_percent is not None:
-        values.append(args.expand_percent)
+        n += 1
+        val = 1.0 + args.expand_percent / 100.0
     if args.condense_percent is not None:
-        values.append(-args.condense_percent)
-    if len(values) > 1:
+        n += 1
+        val = 1.0 - args.condense_percent / 100.0
+    if n > 1:
         print("Error: --width, --expand, --condense are mutually exclusive.")
         sys.exit(2)
-    return values[0] if values else 0
+    return val if n >= 1 else 1.0
 
 def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
     """
