@@ -566,27 +566,41 @@ def _apply_horizontal_transform_cff(font: Font, transform: tuple) -> None:
 
 def scale_upm(font: Font, scale: float) -> None:
     """
-    Scale font by UPM change (delegates to foundrytools' canonical API).
+    Scale glyph coordinates WITHOUT changing unitsPerEm.
 
     Direct multiplier semantics (unambiguous):
-      - scale 1.0  -> no change (1.0x = original size)
-      - scale 1.5  -> 1.5x bigger
-      - scale 0.5  -> 0.5x smaller (half size)
+      - scale 1.0  -> no change (1.0x)
+      - scale 1.5  -> 1.5x bigger (glyphs)
+      - scale 0.5  -> 0.5x smaller (glyphs)
       - scale 2.0  -> 2x bigger
-      - scale 0.1  -> 0.1x (10% size)
+      - scale 0.1  -> 0.1x
+
+    IMPORTANT: This function preserves unitsPerEm (the font's design grid
+    stays at its original value). All glyph coordinates, advance widths,
+    and OS/2 metrics ARE scaled by `scale`.
+
+    Why preserve unitsPerEm?
+      When you install a font, the OS uses unitsPerEm to determine the
+      rendered size: 1 em = (unitsPerEm) design units, and 1 em = N pixels
+      at the chosen point size. If we changed unitsPerEm, the OS would
+      compensate and render at the SAME physical size. By keeping unitsPerEm
+      constant and only scaling glyph coordinates, the font appears BIGGER
+      (or smaller) when rendered at the same point size in your apps.
 
     Safety caps: [0.10x, 4.00x] to prevent accidental extremes.
 
-    Implementation: change unitsPerEm to new_upem, which scales ALL
-    coordinates uniformly. This is the canonical fontTools pattern (used
-    by fontTools.ttLib.scaleUpem.scale_upem, which foundrytools wraps).
-
-    Note: This changes the font's INTERNAL design grid. When the font is
-    rendered at the SAME point size, the glyphs appear larger/smaller
-    because the font's em-square is now bigger/smaller.
+    Implementation:
+      1. Use foundrytools.Font.scale_upm(new_upm) to scale all coordinates
+         and metrics uniformly (this also changes unitsPerEm).
+      2. Restore unitsPerEm to its original value. The glyphs/metrics stay
+         scaled, but the OS thinks the design grid is still the original size.
     """
     if scale <= 0:
         return  # No scaling for 0 or negative
+
+    if scale == 1.0:
+        logger.debug("Scale 1.0 = no change, skipping")
+        return
 
     # Apply safety caps
     if scale < 0.10:
@@ -597,21 +611,151 @@ def scale_upm(font: Font, scale: float) -> None:
         scale = 4.00
 
     current_upm = font.t_head.units_per_em
-    new_upm = int(round(current_upm * scale))
-    new_upm = max(MIN_UPM, min(MAX_UPM, new_upm))
+    # Calculate what upem would be after scaling (used for the temp scale)
+    scaled_upm = int(round(current_upm * scale))
+    scaled_upm = max(MIN_UPM, min(MAX_UPM, scaled_upm))
 
-    if new_upm == current_upm:
-        if scale == 1.0:
-            logger.debug("Scale 1.0 = no change, skipping")
-        else:
-            logger.debug(f"Scale {scale} rounds to same upm ({new_upm}), skipping")
+    if scaled_upm == current_upm:
+        # Scale rounds to same upm, no work to do
+        logger.debug(f"Scale {scale} rounds to same upm, no effective change")
         return
 
-    logger.info(f"Scaling font: {scale}x (upem {current_upm} -> {new_upm})")
-    font.scale_upm(new_upm)
+    # Step 1: Scale everything by 'scale' (this changes upem too)
+    font.scale_upm(scaled_upm)
+    # Step 2: Restore upem to original - this is the KEY for "bigger text at same point size"
+    # NOTE: foundrytools HeadTable exposes units_per_em as a read-only property,
+    # so we set it on the underlying fontTools table directly.
+    font.t_head.table.unitsPerEm = current_upm
+    font.ttfont['head'].unitsPerEm = current_upm
+
+    logger.info(
+        f"Scaled font {scale}x (upem kept at {current_upm}, "
+        f"glyphs and metrics scaled)"
+    )
 
 
 
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="OTF/TTF Font Optimization Script v9 (foundrytools-based)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument('input', help='Input font file or directory')
+    parser.add_argument('output', help='Output directory')
+
+    # --- Scaling ---
+    parser.add_argument('--scale', type=float, default=0, dest='scale_percent',
+                        help='[v9] Scale font by UPM change. Direct multiplier: '
+                             'scale 1.0 = no change; 1.5 = 1.5x bigger; 0.5 = 0.5x smaller. '
+                             'IMPORTANT: scales glyphs but PRESERVES unitsPerEm, '
+                             'so the font renders BIGGER at the same point size '
+                             '(the OS does NOT compensate). '
+                             'Capped at [0.10x, 4.00x].')
+    parser.add_argument('--width', type=float, default=0, dest='width_percent',
+                        help='[v9] Adjust horizontal width only. Positive = expand, negative = condense.')
+    parser.add_argument('--expand', type=float, default=None, dest='expand_percent',
+                        help='[v9] Alias for --width with positive value.')
+    parser.add_argument('--condense', type=float, default=None, dest='condense_percent',
+                        help='[v9] Alias for --width with negative value.')
+    parser.add_argument('--thickness', type=float, default=0, dest='thickness_percent',
+                        help='[v9] Thicken stems without scaling font (inset-rescale).')
+
+    # --- Hinting ---
+    parser.add_argument('--autohint', action='store_true', default=True, dest='autohint',
+                        help='[v9] Autohint with ttfautohint-py / AFDKO otfautohint (default: ON).')
+    parser.add_argument('--no-autohint', action='store_false', dest='autohint',
+                        help='[v9] Skip autohinting.')
+    parser.add_argument('--hint-tune', action='store_true', dest='hint_tune',
+                        help='[v9] Tune CFF Private dict defaults (LanguageGroup, ExpansionFactor, etc.).')
+    parser.add_argument('--rebuild-hints', action='store_true', dest='rebuild_hints',
+                        help='[v9] Recalculate BlueValues/OtherBlues AND StdHW/StdVW/StemSnap* '
+                             'from REAL glyph metrics (foundrytools.app.otf_recalc_zones / '
+                             'otf_recalc_stems). Much more accurate than OS/2-based synthesis.')
+    parser.add_argument('--blue-quantise', type=int, default=0, dest='blue_quantise',
+                        help='[v9] Round BlueValues/OtherBlues to N-unit grid (e.g. 4, 8).')
+
+    # --- Cleanup ---
+    parser.add_argument('--shape-cleanup', action='store_true', dest='shape_cleanup',
+                        help='[v9] Remove overlaps and correct contour direction (skia-pathops).')
+    parser.add_argument('--pixel-snap', type=int, default=0, dest='pixel_snap',
+                        help='[v9] Round CFF coordinates to integers (0=disable).')
+
+    # --- v8.5 backward-compatibility aliases (no-op or mapped) ---
+    # These flags were accepted by v8.5 but were either redundant in v9
+    # (now enabled by default) or no longer apply. They are accepted
+    # silently so old commands work without "unrecognized argument" errors.
+    parser.add_argument('--solid', action='store_true', default=False, dest='solid_legacy',
+                        help=argparse.SUPPRESS)  # v8.5: enable solid mode (now always on)
+    parser.add_argument('--clear-shaping', action='store_true', default=False, dest='clear_shaping',
+                        help=argparse.SUPPRESS)  # v8.5: enable clear-shaping (now always on)
+    parser.add_argument('--no-overlap-remove', action='store_true', default=False, dest='no_overlap_remove',
+                        help=argparse.SUPPRESS)  # v8.5: skip overlap removal (no-op in v9)
+    parser.add_argument('--no-stem-round', action='store_true', default=False, dest='no_stem_round',
+                        help=argparse.SUPPRESS)  # v8.5: skip stem rounding (no-op in v9)
+    parser.add_argument('--no-flex', action='store_true', default=False, dest='no_flex',
+                        help=argparse.SUPPRESS)  # v8.5: psautohint --no-flex
+    parser.add_argument('--no-hint-sub', action='store_true', default=False, dest='no_hint_sub',
+                        help=argparse.SUPPRESS)  # v8.5: psautohint --no-hint-sub
+    parser.add_argument('--allow-changes', action='store_true', default=False, dest='allow_changes',
+                        help=argparse.SUPPRESS)  # v8.5: psautohint -c
+    parser.add_argument('--dropout-control', action='store_true', default=False, dest='dropout_control',
+                        help=argparse.SUPPRESS)  # v8.5: TrueType dropout control
+    parser.add_argument('--hinting-range-min', type=int, default=0, dest='hinting_range_min',
+                        help=argparse.SUPPRESS)  # v8.5: min ppem for hinting
+    parser.add_argument('--hinting-range-max', type=int, default=0, dest='hinting_range_max',
+                        help=argparse.SUPPRESS)  # v8.5: max ppem for hinting
+    parser.add_argument('--gasp-mode', type=str, default=None, dest='gasp_mode',
+                        help=argparse.SUPPRESS)  # v8.5: detailed/simple GASP
+    parser.add_argument('--pixel-gasp', action='store_true', default=False, dest='pixel_gasp',
+                        help=argparse.SUPPRESS)  # v8.5: pixel-aligned GASP
+    parser.add_argument('--x-height-hint', type=int, default=0, dest='x_height_hint',
+                        help=argparse.SUPPRESS)  # v8.5: x-height increase %
+    parser.add_argument('--strength', type=int, default=0, dest='strength',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint strength
+    parser.add_argument('--detailed', action='store_true', default=False, dest='detailed',
+                        help=argparse.SUPPRESS)  # v8.5: detailed TTF instructions
+    parser.add_argument('--stem-width', type=int, default=0, dest='stem_width',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint stem width
+    parser.add_argument('--no-combining', action='store_true', default=False, dest='no_combining',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint no combining
+    parser.add_argument('--x-height-snap-exceptions', type=str, default=None, dest='x_height_snap_exceptions',
+                        help=argparse.SUPPRESS)  # v8.5: ttfautohint x-height-snap-exceptions
+
+    # --- GASP ---
+    parser.add_argument('--gasp-detail', type=str, default='aggressive', dest='gasp_detail',
+                        choices=['minimal', 'balanced', 'aggressive', 'pixel'],
+                        help='[v9] GASP table granularity.')
+
+    # --- OS/2 ---
+    parser.add_argument('--weight-offset', type=int, default=0, dest='weight_offset',
+                        help='[v9] Add this to usWeightClass (0=no change). WARNING: affects font matching.')
+
+    # --- Naming ---
+    parser.add_argument('--set-prod-names', action='store_true', dest='set_prod_names',
+                        help='[v9] Rename glyphs to production names from cmap (foundrytools.Font.set_production_names).')
+
+    # --- Verbosity ---
+    parser.add_argument('-v', '--verbose', action='store_true', dest='verbose',
+                        help='[v9] Verbose logging.')
+
+    return parser
+
+
+def resolve_width(args) -> float:
+    """Resolve --width/--expand/--condense aliases to a single signed value."""
+    values = []
+    if args.width_percent:
+        values.append(args.width_percent)
+    if args.expand_percent is not None:
+        values.append(args.expand_percent)
+    if args.condense_percent is not None:
+        values.append(-args.condense_percent)
+    if len(values) > 1:
+        print("Error: --width, --expand, --condense are mutually exclusive.")
+        sys.exit(2)
+    return values[0] if values else 0
 
 def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
     """
@@ -746,6 +890,7 @@ def optimize_font(input_path: str, output_path: str, options: dict) -> bool:
         return False
 
 
+
 def _patch_afdko_logging() -> None:
     """
     Patch AFDKO's otfautohint logging to handle missing custom attributes.
@@ -814,123 +959,6 @@ def _psautohint_fallback(font: Font) -> None:
 #  v9: CLI argument parsing
 # ---------------------------------------------------------------------------
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="OTF/TTF Font Optimization Script v9 (foundrytools-based)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    parser.add_argument('input', help='Input font file or directory')
-    parser.add_argument('output', help='Output directory')
-
-    # --- Scaling ---
-    parser.add_argument('--scale', type=float, default=0, dest='scale_percent',
-                        help='[v9] Scale font by UPM change. Direct multiplier: '
-                             'scale 1.0 = no change; 1.5 = 1.5x bigger; 0.5 = 0.5x smaller. '
-                             'Capped at [0.10x, 4.00x].')
-    parser.add_argument('--width', type=float, default=0, dest='width_percent',
-                        help='[v9] Adjust horizontal width only. Positive = expand, negative = condense.')
-    parser.add_argument('--expand', type=float, default=None, dest='expand_percent',
-                        help='[v9] Alias for --width with positive value.')
-    parser.add_argument('--condense', type=float, default=None, dest='condense_percent',
-                        help='[v9] Alias for --width with negative value.')
-    parser.add_argument('--thickness', type=float, default=0, dest='thickness_percent',
-                        help='[v9] Thicken stems without scaling font (inset-rescale).')
-
-    # --- Hinting ---
-    parser.add_argument('--autohint', action='store_true', default=True, dest='autohint',
-                        help='[v9] Autohint with ttfautohint-py / AFDKO otfautohint (default: ON).')
-    parser.add_argument('--no-autohint', action='store_false', dest='autohint',
-                        help='[v9] Skip autohinting.')
-    parser.add_argument('--hint-tune', action='store_true', dest='hint_tune',
-                        help='[v9] Tune CFF Private dict defaults (LanguageGroup, ExpansionFactor, etc.).')
-    parser.add_argument('--rebuild-hints', action='store_true', dest='rebuild_hints',
-                        help='[v9] Recalculate BlueValues/OtherBlues AND StdHW/StdVW/StemSnap* '
-                             'from REAL glyph metrics (foundrytools.app.otf_recalc_zones / '
-                             'otf_recalc_stems). Much more accurate than OS/2-based synthesis.')
-    parser.add_argument('--blue-quantise', type=int, default=0, dest='blue_quantise',
-                        help='[v9] Round BlueValues/OtherBlues to N-unit grid (e.g. 4, 8).')
-
-    # --- Cleanup ---
-    parser.add_argument('--shape-cleanup', action='store_true', dest='shape_cleanup',
-                        help='[v9] Remove overlaps and correct contour direction (skia-pathops).')
-    parser.add_argument('--pixel-snap', type=int, default=0, dest='pixel_snap',
-                        help='[v9] Round CFF coordinates to integers (0=disable).')
-
-    # --- v8.5 backward-compatibility aliases (no-op or mapped) ---
-    # These flags were accepted by v8.5 but were either redundant in v9
-    # (now enabled by default) or no longer apply. They are accepted
-    # silently so old commands work without "unrecognized argument" errors.
-    parser.add_argument('--solid', action='store_true', default=False, dest='solid_legacy',
-                        help=argparse.SUPPRESS)  # v8.5: enable solid mode (now always on)
-    parser.add_argument('--clear-shaping', action='store_true', default=False, dest='clear_shaping',
-                        help=argparse.SUPPRESS)  # v8.5: enable clear-shaping (now always on)
-    parser.add_argument('--no-overlap-remove', action='store_true', default=False, dest='no_overlap_remove',
-                        help=argparse.SUPPRESS)  # v8.5: skip overlap removal (no-op in v9)
-    parser.add_argument('--no-stem-round', action='store_true', default=False, dest='no_stem_round',
-                        help=argparse.SUPPRESS)  # v8.5: skip stem rounding (no-op in v9)
-    parser.add_argument('--no-flex', action='store_true', default=False, dest='no_flex',
-                        help=argparse.SUPPRESS)  # v8.5: psautohint --no-flex
-    parser.add_argument('--no-hint-sub', action='store_true', default=False, dest='no_hint_sub',
-                        help=argparse.SUPPRESS)  # v8.5: psautohint --no-hint-sub
-    parser.add_argument('--allow-changes', action='store_true', default=False, dest='allow_changes',
-                        help=argparse.SUPPRESS)  # v8.5: psautohint -c
-    parser.add_argument('--dropout-control', action='store_true', default=False, dest='dropout_control',
-                        help=argparse.SUPPRESS)  # v8.5: TrueType dropout control
-    parser.add_argument('--hinting-range-min', type=int, default=0, dest='hinting_range_min',
-                        help=argparse.SUPPRESS)  # v8.5: min ppem for hinting
-    parser.add_argument('--hinting-range-max', type=int, default=0, dest='hinting_range_max',
-                        help=argparse.SUPPRESS)  # v8.5: max ppem for hinting
-    parser.add_argument('--gasp-mode', type=str, default=None, dest='gasp_mode',
-                        help=argparse.SUPPRESS)  # v8.5: detailed/simple GASP
-    parser.add_argument('--pixel-gasp', action='store_true', default=False, dest='pixel_gasp',
-                        help=argparse.SUPPRESS)  # v8.5: pixel-aligned GASP
-    parser.add_argument('--x-height-hint', type=int, default=0, dest='x_height_hint',
-                        help=argparse.SUPPRESS)  # v8.5: x-height increase %
-    parser.add_argument('--strength', type=int, default=0, dest='strength',
-                        help=argparse.SUPPRESS)  # v8.5: ttfautohint strength
-    parser.add_argument('--detailed', action='store_true', default=False, dest='detailed',
-                        help=argparse.SUPPRESS)  # v8.5: detailed TTF instructions
-    parser.add_argument('--stem-width', type=int, default=0, dest='stem_width',
-                        help=argparse.SUPPRESS)  # v8.5: ttfautohint stem width
-    parser.add_argument('--no-combining', action='store_true', default=False, dest='no_combining',
-                        help=argparse.SUPPRESS)  # v8.5: ttfautohint no combining
-    parser.add_argument('--x-height-snap-exceptions', type=str, default=None, dest='x_height_snap_exceptions',
-                        help=argparse.SUPPRESS)  # v8.5: ttfautohint x-height-snap-exceptions
-
-    # --- GASP ---
-    parser.add_argument('--gasp-detail', type=str, default='aggressive', dest='gasp_detail',
-                        choices=['minimal', 'balanced', 'aggressive', 'pixel'],
-                        help='[v9] GASP table granularity.')
-
-    # --- OS/2 ---
-    parser.add_argument('--weight-offset', type=int, default=0, dest='weight_offset',
-                        help='[v9] Add this to usWeightClass (0=no change). WARNING: affects font matching.')
-
-    # --- Naming ---
-    parser.add_argument('--set-prod-names', action='store_true', dest='set_prod_names',
-                        help='[v9] Rename glyphs to production names from cmap (foundrytools.Font.set_production_names).')
-
-    # --- Verbosity ---
-    parser.add_argument('-v', '--verbose', action='store_true', dest='verbose',
-                        help='[v9] Verbose logging.')
-
-    return parser
-
-
-def resolve_width(args) -> float:
-    """Resolve --width/--expand/--condense aliases to a single signed value."""
-    values = []
-    if args.width_percent:
-        values.append(args.width_percent)
-    if args.expand_percent is not None:
-        values.append(args.expand_percent)
-    if args.condense_percent is not None:
-        values.append(-args.condense_percent)
-    if len(values) > 1:
-        print("Error: --width, --expand, --condense are mutually exclusive.")
-        sys.exit(2)
-    return values[0] if values else 0
 
 
 def main():
