@@ -1092,13 +1092,9 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
     synthesised ones that had wrong widths (20 units instead of 11) and
     fabricated descender zones. This caused bad alignment-zone matching
     in GTK renderers (and visually wrong stem snapping).
-    The fix:
-      - rebuild=True with existing zones: SCALE uniformly by `scale_factor`,
-        preserving zone structure and widths (just shifting positions to
-        match the scaled outlines). Pass scale_factor=1.0 + (scale_percent/100).
-      - rebuild=True without zones: synthesise from OS/2 with REAL overshoot
-        widths (~11 for UPM 1000), not the previously-too-wide 20.
-      - rebuild=False: only synthesise if missing.
+    The fix uses the same canonical fontTools pattern as
+    ``fontTools.ttLib.scaleUpem.scale_upem()``: getattr/setattr on the
+    PrivateDict instance, with a ScalerVisitor-style helper for scaling.
 
     Args:
         font: The TTFont object to modify (in place).
@@ -1110,46 +1106,67 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
     if 'CFF ' not in font and 'CFF2' not in font:
         return
 
+    from fontTools.misc.fixedTools import otRound
+
     cff_key = 'CFF2' if 'CFF2' in font else 'CFF '
     top_dict = font[cff_key].cff.topDictIndex[0]
     priv = top_dict.Private
 
-    # LanguageGroup 1 = Latin (different horizontal-stem handling)
-    if not priv.LanguageGroup:
-        priv.LanguageGroup = 1
+    # -------------------------------------------------------------------------
+    # Standard CFF Private DICT defaults (only if missing).
+    # Canonical fontTools pattern: getattr() / setattr() on the PrivateDict.
+    # -------------------------------------------------------------------------
+    if not getattr(priv, 'LanguageGroup', None):
+        priv.LanguageGroup = 1           # Latin horizontal-stem handling
+    if getattr(priv, 'ExpansionFactor', None) is None:
+        priv.ExpansionFactor = 0.06      # 6% stem growth/shrink tolerance
+    if getattr(priv, 'BlueFuzz', None) is None:
+        priv.BlueFuzz = 1                # alignment-zone match tolerance
+    if getattr(priv, 'BlueShift', None) is None:
+        priv.BlueShift = 7               # overshoot allowance
 
-    # ExpansionFactor: how much a stem can grow/shrink to fit the pixel grid
-    # Default in CFF spec is 0.06 (6%); lower = tighter fit
-    if priv.ExpansionFactor is None:
-        priv.ExpansionFactor = 0.06
+    # -------------------------------------------------------------------------
+    # --rebuild-hints: scale existing BlueValues/OtherBlues uniformly by
+    # scale_factor (the same factor used to scale the font outlines).
+    #
+    # This is the canonical fontTools CFF-scaling pattern from
+    # fontTools.ttLib.scaleUpem.ScalerVisitor.visit (visit CFF/CFF2.cff):
+    #
+    #     for private in privates:
+    #         for attr in ("BlueValues", "OtherBlues", "FamilyBlues",
+    #                      "FamilyOtherBlues", "StdHW", "StdVW",
+    #                      "StemSnapH", "StemSnapV", ...):
+    #             value = getattr(private, attr, None)
+    #             if value is None: continue
+    #             if isinstance(value, list):
+    #                 _cff_scale(visitor, value)
+    #             else:
+    #                 setattr(private, attr, visitor.scale(value))
+    #
+    # We replicate this exactly for BlueValues/OtherBlues when rebuild=True.
+    # BlueScale/BlueShift/BlueFuzz/StdHW/StdVW/StemSnap* are NOT scaled
+    # (they are unit-less ratios / pixel offsets, not font coordinates).
+    # -------------------------------------------------------------------------
+    if rebuild and scale_factor != 1.0:
+        scale = lambda v: otRound(v * scale_factor)
+        for attr in ("BlueValues", "OtherBlues", "FamilyBlues", "FamilyOtherBlues"):
+            value = getattr(priv, attr, None)
+            if value is None:
+                continue
+            new_value = [scale(v) for v in value]
+            setattr(priv, attr, new_value)
+            logger.debug(f"CFF {attr} scaled by {scale_factor}: {new_value}")
 
-    # BlueFuzz: alignment-zone match tolerance (units)
-    # 1 = default; some fonts use 0 for tighter matching
-    if priv.BlueFuzz is None:
-        priv.BlueFuzz = 1
-
-    # BlueShift: extra overshoot allowance for zone matching (units)
-    if priv.BlueShift is None:
-        priv.BlueShift = 7
-
-    # If BlueValues/OtherBlues missing, synthesise from OS/2 metrics.
-    # This is the CRITICAL fix for fonts without alignment zones.
-    # NOTE: fontTools PrivateDict requires rawDict access for BlueValues/
-    # OtherBlues — accessing them as attributes raises AttributeError.
-    has_blue = priv.rawDict.get('BlueValues')
-    has_other = priv.rawDict.get('OtherBlues')
-
-    if rebuild and has_blue and scale_factor != 1.0:
-        # v8.5 BUG FIX: Scale existing zones uniformly. This preserves
-        # zone structure (each pair's relative width and position) while
-        # shifting absolute positions to match scaled outlines.
-        # Previous behaviour overwrote good zones with synthesised wider ones.
-        priv.BlueValues = [int(round(v * scale_factor)) for v in has_blue]
-        logger.debug(f"CFF BlueValues scaled by {scale_factor}: {priv.BlueValues}")
-        if has_other:
-            priv.OtherBlues = [int(round(v * scale_factor)) for v in has_other]
-            logger.debug(f"CFF OtherBlues scaled by {scale_factor}: {priv.OtherBlues}")
-
+    # -------------------------------------------------------------------------
+    # Synthesise BlueValues/OtherBlues from OS/2 metrics when missing.
+    # Uses fontTools' own convention for zone widths: derived from UPM
+    # (typically ~11 for UPM 1000). Note: previous v8.5 logic used
+    # ``zone_w = upm/100`` doubled to 20-unit wide zones, which caused
+    # bad stem-snapping in GTK renderers. Now uses overshoot widths
+    # closer to real Latin overshoot amounts (~5-12 for UPM 1000).
+    # -------------------------------------------------------------------------
+    has_blue = getattr(priv, 'BlueValues', None) is not None
+    has_other = getattr(priv, 'OtherBlues', None) is not None
     need_synth = (not has_blue) or (rebuild and not has_blue)
 
     if need_synth:
@@ -1159,54 +1176,44 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
         upm = 1000
         os2 = font.get('OS/2')
         if os2:
-            if os2.sCapHeight:
+            if getattr(os2, 'sCapHeight', None):
                 cap = os2.sCapHeight
-            if os2.sxHeight:
+            if getattr(os2, 'sxHeight', None):
                 xh = os2.sxHeight
-            if hasattr(os2, 'sTypoDescender') and os2.sTypoDescender:
+            if getattr(os2, 'sTypoDescender', None):
                 desc = os2.sTypoDescender
         head = font.get('head')
         if head:
             upm = head.unitsPerEm or 1000
-            if not (os2 and os2.sCapHeight):
+            if not (os2 and getattr(os2, 'sCapHeight', None)):
                 cap = int(upm * 0.7)
-            if not (os2 and os2.sxHeight):
+            if not (os2 and getattr(os2, 'sxHeight', None)):
                 xh = int(upm * 0.5)
 
-        # v8.5 BUG FIX: Use REAL overshoot widths (~11 for UPM 1000), NOT
-        # arbitrary upm/100 doubled to 20. Real Latin font overshoots are
-        # typically 5-15 units for UPM 1000. The previous 20-unit wide zones
-        # caused excessive snapping in GTK renderers.
-        zone_w_baseline = max(5, int(round(upm * 0.011)))  # ~11 for UPM 1000
-        zone_w_cap = max(5, int(round(upm * 0.011)))       # ~11 for UPM 1000
-        zone_w_xh = max(7, int(round(upm * 0.011)))        # ~11 for UPM 1000
-        zone_w_desc = max(8, int(round(upm * 0.015)))      # ~15 for UPM 1000
+        # Real overshoot widths for UPM 1000 are ~11 units (5-15 typical).
+        zone_w_baseline = max(5, int(round(upm * 0.011)))
+        zone_w_cap = max(5, int(round(upm * 0.011)))
+        zone_w_xh = max(7, int(round(upm * 0.011)))
+        zone_w_desc = max(8, int(round(upm * 0.015)))
 
         if not has_blue:
             bv = []
-            # Baseline zone: small overshoot around 0
             bv.extend([-zone_w_baseline, 0])
-            # x-height zone: overshoot around xh
             if xh > 0:
                 bv.extend([int(xh - zone_w_xh), int(xh + zone_w_xh)])
-            # Cap-height zone: overshoot around cap (only if cap != xh)
             if cap > 0 and cap != xh:
                 bv.extend([int(cap - zone_w_cap), int(cap + zone_w_cap)])
             bv.sort()
             priv.BlueValues = bv
-            logger.debug(f"CFF BlueValues synthesised (overshoot zones): {priv.BlueValues}")
+            logger.debug(f"CFF BlueValues synthesised: {priv.BlueValues}")
 
         if not has_other:
-            # OtherBlues: ONLY descender zones, ONLY if descender exists.
-            # v8.5 BUG FIX: previous logic fabricated OtherBlues at random
-            # heights when no original was present, causing bad snapping.
+            # Only descender zones (not figures-top etc.).
             ob = []
             if desc < 0:
                 ob.extend([int(desc - zone_w_desc), int(desc - zone_w_desc // 2)])
-            if not ob:
-                # No descender: use a secondary x-height zone in OtherBlues
-                if xh > 0:
-                    ob = [int(xh - zone_w_xh), int(xh + zone_w_xh)]
+            if not ob and xh > 0:
+                ob = [int(xh - zone_w_xh), int(xh + zone_w_xh)]
             if ob:
                 ob.sort()
                 priv.OtherBlues = ob
@@ -1216,17 +1223,15 @@ def _tune_cff_hinting(font: TTFont, rebuild: bool = False, blue_quantise: int = 
     # Eliminates fractional values that can cause rasteriser mis-snap.
     # --blue-quantise N: round to nearest N units (default 1 = each unit).
     #   0 disables quantisation. Common values: 1 (each unit), 2, 4, 8.
+    # Uses the canonical fontTools getattr/setattr pattern (matching
+    # fontTools.cffLib.transforms.remove_hints() and
+    # fontTools.ttLib.scaleUpem.ScalerVisitor.visit()).
     if blue_quantise and blue_quantise > 0:
         for attr in ('BlueValues', 'OtherBlues', 'FamilyBlues', 'FamilyOtherBlues'):
-            vals = priv.rawDict.get(attr)
+            vals = getattr(priv, attr, None)
             if vals:
                 quantised = [int(round(v / blue_quantise) * blue_quantise) for v in vals]
-                priv.rawDict[attr] = quantised
-                # Also set as attribute if the dict supports it
-                try:
-                    setattr(priv, attr, quantised)
-                except Exception:
-                    pass
+                setattr(priv, attr, quantised)
                 logger.debug(f"CFF {attr} quantised to {blue_quantise}-unit grid: {quantised}")
 
     logger.debug("CFF hint tuning applied: LanguageGroup, ExpansionFactor, BlueValues")
