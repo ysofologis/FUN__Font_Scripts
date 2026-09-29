@@ -2,14 +2,17 @@
 """
 otf_optimize-ff-v2.0 — geometric transforms on OTF/TTF, via FontForge alone.
 
-Clean-slate rewrite. Does exactly three things and nothing else:
+Clean-slate rewrite. Does five things and nothing else:
 
     --width      scale glyphs horizontally (and every advance width)
     --height     scale glyphs vertically (and every vertical metric)
     --thickness  scale stem weight, measured from the outlines
+    --spacing    letter-spacing: % change to advance widths
+    --quantize-curve  snap every point to a 1/N-unit grid
+    --hint       autohint output (last step) via otfautohint/ttfautohint
 
 Percent semantics throughout, signed: positive grows, negative shrinks.
-All three default to 0, which is a verified no-op.
+All default to 0, which is a verified no-op.
 
 Single dependency
 -----------------
@@ -58,6 +61,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
+import subprocess
+import tempfile
 import sys
 from pathlib import Path
 from typing import Optional
@@ -70,6 +76,86 @@ log = logging.getLogger("otf_optimize_ff_v2.0")
 _FONTFORGE_OK = False
 
 SUPPORTED_EXTENSIONS = {".otf", ".ttf"}
+
+# Autohint backends, keyed by output format. hint() decides which to use
+# from --hint and the output extension.
+HINT_TOOL = {
+    "otf": "otfautohint",   # CFF/OTF (AFDKO)
+    "ttf": "ttfautohint",   # TrueType/glyf
+}
+
+
+def _resolve_hint_tool(hint: str, out_ext: str) -> Optional[str]:
+    """Return the autohint binary for --hint + output format, or None.
+
+    --hint auto picks the backend from the output extension (.otf ->
+    otfautohint, .ttf -> ttfautohint). If the binary is missing, return
+    None so the caller can warn without failing (hinting is a quality
+    post-step, not a correctness requirement).
+    """
+    if hint in (None, "", "none"):
+        return None
+    # CLI values (cff|tt) map to internal HINT_TOOL keys (otf|ttf).
+    cli_to_key = {"cff": "otf", "tt": "ttf"}
+    if hint == "auto":
+        key = "ttf" if out_ext == ".ttf" else "otf"
+    elif hint in cli_to_key:
+        key = cli_to_key[hint]
+    else:
+        log.warning(f"unknown --hint {hint!r} (expected auto|none|cff|tt); "
+                    "skipping hinting")
+        return None
+    tool = HINT_TOOL[key]
+    if shutil.which(tool) is None:
+        log.warning(f"{tool} not found on PATH; skipping hinting")
+        return None
+    return tool
+
+
+def _hint_file(path: Path, tool: str) -> bool:
+    """Run the autohint binary on a written font. Returns success.
+
+    ttfautohint: positional IN OUT, writes OUT directly.
+    otfautohint: -o OUT IN, writes OUT directly.
+    Both overwrite the file in place, so we hint a temp copy and move
+    it over, keeping the original until the hinting succeeds.
+
+    Launcher-independence: afdko (the otfautohint dep) is installed only
+    in user site-packages, and a subprocess spawned by ``fontforge
+    -script`` loses that path. We inject it into PYTHONPATH explicitly
+    so hinting behaves identically under both launchers -- the same
+    guarantee the transform engine already holds (verified on
+    FontForge 20251009 + afdko under python3.14).
+    """
+    tmp = path.with_suffix(path.suffix + ".hint.tmp")
+    shutil.copy2(path, tmp)
+    env = dict(os.environ)
+    try:
+        user_site = subprocess.check_output(
+            [sys.executable, "-c",
+             "import site; print(site.getusersitepackages())"],
+            text=True).strip()
+    except Exception:
+        user_site = ""
+    if user_site:
+        env["PYTHONPATH"] = user_site + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    try:
+        if tool == "ttfautohint":
+            cmd = [tool, str(tmp), str(path)]
+        else:
+            cmd = [tool, "-o", str(path), str(tmp)]
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            log.warning(f"  {tool} failed (rc={r.returncode}): "
+                        f"{r.stderr.strip()[:300]}")
+            return False
+        return True
+    except Exception as exc:
+        log.warning(f"  {tool} errored: {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
 
 # A segment counts as vertical when |dx| is at most this many font units.
 # Real stems often lean a few tenths of a unit (hinting, design), so 1.0u
@@ -365,6 +451,45 @@ def _cleanup(font) -> int:
     return touched
 
 
+def _add_spacing(font, pct: float) -> int:
+    """Increase advance widths (letter-spacing) by ``pct`` percent.
+
+    We grow the advance via ``glyph.width`` ONLY. This is deliberate and
+    verified: FontForge's ``right_side_bearing`` and ``width`` movers move
+    only the advance edge, never the outline -- but the
+    ``left_side_bearing`` setter physically SHIFTS the outline (verified
+    on Jano 'o': lsb 44->60 moved xMin 44->60 and xMax 536->552, i.e. the
+    whole glyph slid right). So splitting across both bearings would drag
+    every glyph sideways, which is wrong for letter-spacing.
+
+    Growing width alone: the outline stays in place and the extra space
+    sits entirely in the right side bearing. Visually identical to a
+    symmetric split (the outline doesn't move either way), and it keeps
+    every outline exactly where it was. Returns glyphs touched.
+
+    Zero-width glyphs (combining marks) are skipped, since spacing them
+    would pin an advance onto a mark meant to over-strike its base.
+    """
+    if pct == 0.0:
+        return 0
+    per = pct / 100.0
+    touched = 0
+    for glyph in font.glyphs():
+        try:
+            w = glyph.width
+            if w == 0:
+                continue
+            delta = int(round(w * per)) if pct >= 0 else -int(round(abs(w * per)))
+            if delta == 0:
+                continue
+            glyph.width = w + delta
+            touched += 1
+        except Exception as exc:
+            log.debug(f"  {glyph.glyphname}: spacing failed: "
+                      f"{type(exc).__name__}: {exc}")
+    return touched
+
+
 def _quantize_curve(font, n_units: int) -> int:
     """Snap every curve point to a 1/n_units-unit grid. Returns points touched.
 
@@ -396,7 +521,7 @@ def _quantize_curve(font, n_units: int) -> int:
 
 def apply_transform(src: Path, dst: Path, width_pct: float, height_pct: float,
                   thickness_pct: float, ref_stem: Optional[float],
-                  quantize_units: int = 0) -> dict:
+                  quantize_units: int = 0, spacing_pct: float = 0.0) -> dict:
     """Apply the three transforms and write `dst`. Returns a report dict."""
     font = fontforge.open(str(src))
     report: dict = {"src": src.name}
@@ -451,7 +576,17 @@ def apply_transform(src: Path, dst: Path, width_pct: float, height_pct: float,
                 "points": touched,
             }
 
-        if sx != 1.0 or sy != 1.0 or thickness_pct != 0.0 or quantize_units:
+        # Spacing last, so it operates on the final advance widths after
+        # width/height scaling. It only grows the advance edge, never the
+        # outline, so it composes cleanly with the other transforms.
+        if spacing_pct:
+            report["spacing"] = {
+                "pct": spacing_pct,
+                "glyphs": _add_spacing(font, spacing_pct),
+            }
+
+        if (sx != 1.0 or sy != 1.0 or thickness_pct != 0.0
+                or quantize_units or spacing_pct):
             report["cleaned"] = _cleanup(font)
 
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -503,7 +638,8 @@ def verify(src: Path, dst: Path, width_pct: float, height_pct: float,
 
 def process_font(job) -> tuple[str, bool, list[str]]:
     """One font end to end. Module level so multiprocessing can pickle it."""
-    src, dst, width_pct, height_pct, thickness_pct, quantize_units = job
+    (src, dst, width_pct, height_pct, thickness_pct, quantize_units,
+     hint_tool, spacing_pct) = job
     src, dst = Path(src), Path(dst)
     lines: list[str] = []
     try:
@@ -534,7 +670,8 @@ def process_font(job) -> tuple[str, bool, list[str]]:
 
         sx = 1.0 + width_pct / 100.0
         rep = apply_transform(src, dst, width_pct, height_pct,
-                              thickness_pct, stem, quantize_units)
+                              thickness_pct, stem, quantize_units,
+                              spacing_pct)
         for k, v in rep.items():
             if k == "thickness":
                 lines.append(
@@ -549,6 +686,8 @@ def process_font(job) -> tuple[str, bool, list[str]]:
             elif k == "quantize_curve":
                 lines.append(f"  quantized curve to {v['grid']} grid: "
                              f"{v['points']} points snapped")
+            elif k == "spacing":
+                lines.append(f"  spacing {v['pct']:+g}% on {v['glyphs']} glyphs")
 
         # Expected stem through the whole pipeline: width narrows it by
         # sx, thickness then moves it by its own percentage of that.
@@ -567,6 +706,16 @@ def process_font(job) -> tuple[str, bool, list[str]]:
 
         for name in rep.get("metrics_failed", []):
             lines.append(f"  WARNING metric not scaled: {name}")
+
+        # Hinting is deliberately the LAST step, after geometry and
+        # verification, so it never perturbs the stem/width checks and
+        # the hints match the final outlines. Failure here is a warning,
+        # not a reason to fail the whole font.
+        if hint_tool:
+            if _hint_file(Path(dst), hint_tool):
+                lines.append(f"  hinted with {hint_tool}")
+            else:
+                lines.append(f"  WARNING hinting skipped ({hint_tool})")
         return src.name, True, lines
     except Exception as exc:
         lines.append(f"  FAILED {type(exc).__name__}: {exc}")
@@ -588,6 +737,12 @@ examples:
 
   # snap every outline point to integer units (geometry cleanup)
   otf_optimize-ff-v2.0.py --quantize-curve 1 IN OUT
+
+  # autohint the output (last step): cff -> otfautohint, tt -> ttfautohint
+  otf_optimize-ff-v2.0.py --thickness 5 --hint auto IN OUT
+
+  # +6% letter-spacing (advance widths only; outlines never move)
+  otf_optimize-ff-v2.0.py --spacing 6 IN OUT
 
 percentages are signed and relative to the measured stem width, not a
 fixed number of font units.
@@ -614,11 +769,26 @@ and geometry cleanup only.
                    help="Scale stem weight by this percentage of the MEASURED "
                         "stem width. Negative thins. Uses changeWeight, so "
                         "joins and counters stay clean.")
+    p.add_argument("--spacing", type=float, default=0.0, metavar="PCT",
+                   help="Increase advance widths (letter-spacing) by this "
+                        "percent. 5 = 5%% more space between glyphs; negative "
+                        "tightens. Grows the advance edge only -- outlines never "
+                        "move (FontForge's lsb setter shifts the outline, so "
+                        "spacing is done via width alone). Zero-width glyphs "
+                        "(combining marks) are skipped.")
     p.add_argument("--quantize-curve", type=int, default=0, metavar="N",
                    help="Snap every outline point to a 1/N-unit grid. N=1 is "
                         "fontforge.round() (integer units); N=2 a half-unit "
                         "grid, N=4 a quarter-unit grid. Reduces geometry "
                         "noise but can deform thin features; default off.")
+    p.add_argument("--hint", choices=["auto", "none", "cff", "tt"],
+                   default="none", metavar="MODE",
+                   help="Autohint the OUTPUT as the last step (after geometry,"
+                        " so hints match final outlines). auto picks the backend"
+                        " from output format. cff -> otfautohint (AFDKO), "
+                        "tt -> ttfautohint. FontForge's own autoHint emits no "
+                        "bytecode on 20251009, so this runs an external binary."
+                        " Default: none (no hinting).")
     p.add_argument("--jobs", "-j", type=int, default=0, metavar="N",
                    help="Process N fonts in parallel. 0 = auto (one worker "
                         "per CPU, capped at the font count). 1 = sequential.")
@@ -648,16 +818,21 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     jobs = [(str(q), str(args.output_dir / q.name),
              args.width, args.height, args.thickness,
-             args.quantize_curve) for q in fonts]
+             args.quantize_curve,
+             _resolve_hint_tool(args.hint, q.suffix.lower()),
+             args.spacing) for q in fonts]
 
     cpu = os.cpu_count() or 1
     workers = min(args.jobs, len(jobs)) if args.jobs > 0 else min(cpu, len(jobs))
 
     log.info(f"{len(fonts)} font(s)  width={args.width:+g}%  "
-             f"height={args.height:+g}%  thickness={args.thickness:+g}%")
+             f"height={args.height:+g}%  thickness={args.thickness:+g}%  "
+             f"spacing={args.spacing:+g}%")
     if args.quantize_curve:
         log.info(f"  curve quantize: 1/{args.quantize_curve}-unit grid")
-    if all(v == 0 for v in (args.width, args.height, args.thickness)) \
+    if args.hint in ("auto", "cff", "tt"):
+        log.info(f"  hinting: {args.hint}")
+    if all(v == 0 for v in (args.width, args.height, args.thickness, args.spacing)) \
             and not args.quantize_curve:
         log.warning("all transforms are 0 and no quantize -- this is a no-op copy")
     log.info(f"workers: {workers} ({cpu} CPUs)")

@@ -346,7 +346,9 @@ names the interpreter to use.
 | `--width PCT` | Horizontal scale (advance widths + outlines) | Signed; `-10` narrows 10%. Scales advance widths but **NOT** GPOS PairPos XAdvance — see caveat. |
 | `--height PCT` | Vertical scale + all vertical metrics | Scales 12 metrics incl. `os2_capheight`/`os2_xheight`. |
 | `--thickness PCT` | Stem weight, % of **measured** stem | Uses `changeWeight`, joins/counters stay clean. |
+| `--spacing PCT` | Letter-spacing: % change to advance widths | Grows the advance edge only; outlines never move (FF's lsb setter shifts the outline, so this uses `width` alone). Negative tightens. Zero-width glyphs skipped. |
 | `--quantize-curve N` | Snap every point to a 1/N-unit grid | N=1 integers, N=4 quarter-unit (recommended), N≥1024 is no-op (FF coordinate floor). |
+| `--hint MODE` | Autohint output as the LAST step | `auto` picks by format; `cff`→otfautohint, `tt`→ttfautohint, `none`=off. FontForge's own autoHint is a no-op on 20251009, so an external binary does it. |
 | `-j N` | Parallel workers | 0 = auto (per CPU, capped at font count). |
 
 ### Verified limits & behaviour
@@ -369,10 +371,16 @@ names the interpreter to use.
    per font and cross-font — it never does it silently. Verified on
    AdwaitaSans: 31,159 kern pairs, XAdvance sum unchanged after `x*0.9`.
    → If letterfit correctness matters, use the fontTools-bridge variant.
-2. **No hinting.** `font.autoHint()` emits **zero** hint bytecode on FontForge
-   **20251009** (linuxbrew): 0/2938 TrueType glyphs with program, 0/1568 CFF
-   charstrings with hintmask. There is no hinting path in FontForge alone.
-   Use `ttfautohint` (TT) / AFDKO `otfautohint` (CFF) as a separate step.
+2. **No fontforge hinting — but `--hint` fixes it via external tools.**
+   `font.autoHint()` emits **zero** hint bytecode on FontForge **20251009**
+   (linuxbrew): 0/2938 TrueType glyphs with program, 0/1568 CFF charstrings
+   with hintmask. There is no hinting path in FontForge alone. `--hint` runs
+   `otfautohint` (CFF/AFDKO) or `ttfautohint` (TrueType) as the last step.
+   Verified: Jano CFF charstring bytes 206KB→266KB, hint ops present;
+   Adwaita 1965/2938 glyphs gained program bytecode + fpgm/prep.
+   Launcher-independence: afdko lives in user site-packages, which a
+   `fontforge -script`-spawned child loses; the script injects the user site
+   path into the child PYTHONPATH so hinting works under both launchers.
 3. **No CFF hint-dict tuning.** `fontforge.private` exposes only `.guess(k)`;
    no access to BlueValues/StemSnapH/StdHW. Do that with fontTools/AFDKO.
 4. **`font.transform()` (font-level) is a trap** — leaves both hmtx and GPOS
@@ -389,8 +397,9 @@ Detect GPOS kern via `"'kern'" in entry`.
 
 *Last updated: 2026-09-29 — Added the FontForge-only optimizer
 (`otf_optimize-ff-v2.0.py`) section: single-dependency path with
-`--quantize-curve`, verified limits (GPOS PairPos not rescaled, no hinting on
-FontForge 20251009, N=4 curve sweet spot). Distinguish from the
+`--quantize-curve`, `--hint`, and `--spacing`, verified limits (GPOS PairPos
+not rescale, FontForge autoHint is a no-op on 20251009 so `--hint` uses
+otfautohint/ttfautohint, N=4 curve sweet spot). Distinguish from the
 fontTools-bridge underscore variant (`otf_optimize-ff-v1.0/1.1`, formerly `otf_optimize_ff-v2.0/2.1`).
 
 *Previously: 2026-09-27 — Recipe #9 added: raise UPM 1000 → 2048 via

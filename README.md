@@ -29,7 +29,7 @@ This directory contains Python scripts for improving OTF/TTF font rendering qual
 
 |--------|-------|
 
-| `otf_optimize-ff-v2.0.py` | **(newest, FontForge-only)** Single-tool dependency (FontForge, **no fontTools**). `--width/--height/--thickness/--quantize-curve`. Stem measured from outlines. GPOS PairPos NOT rescaled (warns). Works under both `fontforge -script` and `/usr/bin/python3.14`. See the dedicated section in `RECIPES.md`. |
+| `otf_optimize-ff-v2.0.py` | **(newest, FontForge-only)** Single-tool dependency (FontForge, **no fontTools**). `--width/--height/--thickness/--spacing/--quantize-curve/--hint`. Stem measured from outlines. GPOS PairPos NOT rescaled (warns). FontForge's own `autoHint` is a no-op on 20251009, so `--hint` shells out to `otfautohint`/`ttfautohint`. Works under both `fontforge -script` and `/usr/bin/python3.14`. See the dedicated section in `RECIPES.md`. |
 | `otf_optimize-ff-v1.1.py` | **FontForge + fontTools bridge:** Same FontForge engine but keeps fontTools for GPOS PairPos rescale and CFF post-processing. (Formerly `otf_optimize_ff-v2.1.py`.) NOTE: README below previously claimed FontForge `autoHint` does hinting — that is WRONG on FontForge 20251009 (`autoHint` emits zero hint bytecode). See caveats. |
 
 | `otf_optimize-v9.py` | **Latest (foundrytools-based):** Uses `foundrytools` library (https://foundrytools.readthedocs.io) for canonical APIs. 892 lines (vs 2314 for v8.5). Adds StdHW/StdVW/StemSnap* recalculation from real stem widths, contour correction via skia-pathops, and `set_production_names`. **Direct-multiplier `--scale` semantics**: `1.0` = no change, `1.5` = 1.5x bigger, `0.5` = 0.5x smaller. |
