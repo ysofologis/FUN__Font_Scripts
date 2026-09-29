@@ -29,7 +29,8 @@ This directory contains Python scripts for improving OTF/TTF font rendering qual
 
 |--------|-------|
 
-| `otf_optimize_ff-v2.1.py` | **Latest (FontForge-based):** Single-tool dependency (FontForge), fontTools for post-processing. Has proper --thickness via FontForge changeWeight. |
+| `otf_optimize-ff-v2.0.py` | **(newest, FontForge-only)** Single-tool dependency (FontForge, **no fontTools**). `--width/--height/--thickness/--quantize-curve`. Stem measured from outlines. GPOS PairPos NOT rescaled (warns). Works under both `fontforge -script` and `/usr/bin/python3.14`. See the dedicated section in `RECIPES.md`. |
+| `otf_optimize-ff-v1.1.py` | **FontForge + fontTools bridge:** Same FontForge engine but keeps fontTools for GPOS PairPos rescale and CFF post-processing. (Formerly `otf_optimize_ff-v2.1.py`.) NOTE: README below previously claimed FontForge `autoHint` does hinting — that is WRONG on FontForge 20251009 (`autoHint` emits zero hint bytecode). See caveats. |
 
 | `otf_optimize-v9.py` | **Latest (foundrytools-based):** Uses `foundrytools` library (https://foundrytools.readthedocs.io) for canonical APIs. 892 lines (vs 2314 for v8.5). Adds StdHW/StdVW/StemSnap* recalculation from real stem widths, contour correction via skia-pathops, and `set_production_names`. **Direct-multiplier `--scale` semantics**: `1.0` = no change, `1.5` = 1.5x bigger, `0.5` = 0.5x smaller. |
 
@@ -490,9 +491,9 @@ All Chrome-breaking issues have been fixed:
 
 | **v8** | Initial scaling support (`--scale`). TrueType + CFF auto-hinting. Directory batch processing. |
 
-| **ff-v2.1** | FontForge-based equivalent of v8.2 (FontForge autoHint for hinting, no external psautohint dependency). |
+| **ff-v2.1** | FontForge-based equivalent of v8.2. CAVEAT — the README once claimed FontForge `autoHint` did hinting; it does NOT on FontForge 20251009 (verified: emits zero hint bytecode on both TT and CFF). Auto-hinting here requires an external step (`ttfautohint` / AFDKO). |
 
-| **ff-v2.1** | FontForge-based equivalent of v8.x. v2.0 → v2.1 added: `--width/--expand/--condense` for horizontal scaling (A), fringe-elimination phases (B): `_phase_stem_normalise`, `_phase_flatten_curves`, `_phase_collinear_remove`, etc., `--gasp-detail {minimal,standard,aggressive}` (C), `--shape-cleanup` (D), better CFF BlueValues synthesis from OS/2 metrics (E), `--rebuild-hints` flag (H). |
+| **ff-v2.1** | FontForge-based equivalent of v8.x. v2.0 → v2.1 added: `--width/--expand/--condense` for horizontal scaling (A), fringe-elimination phases (B): `_phase_stem_normalise`, `_phase_flatten_curves`, `_phase_collinear_remove`, etc., `--gasp-detail {minimal,standard,aggressive}` (C), `--shape-cleanup` (D), better CFF BlueValues synthesis from OS/2 metrics (E), `--rebuild-hints` flag (H). (Hinting note: FontForge `autoHint` is a no-op on 20251009.) |
 
 | **ttf2otf_ff_v5** | Fringe elimination specialist (FontForge). v4 → v5 added: `--width` for horizontal expand/condense, `--quantise-curve` for Bezier flattening, `--blue-quantise` for BlueValues grid rounding, `_phase_flatten_curves`, `_phase_stem_align`, `_phase_bezier_integrity`, `_phase_extra_global`, `_phase_quantise_blue_values`. More aggressive anti-fringe passes per glyph. |
 
@@ -576,6 +577,25 @@ Aggressive cleanup: overlap removal, auto-hinting, contour simplification, WOFF/
 
 
 
+#### `otf_optimize-ff-v2.0.py` (FontForge-only, newest)
+
+Clean-slate single-dependency optimizer: **no fontTools**. `--width`/`--height`/
+`--thickness`/`--quantize-curve`, plus `-j` parallelism. Stem measured from
+outlines, not guessed. GPOS PairPos kerning is NOT rescaled by `--width` (the
+script warns loudly rather than silently distorting letterfit). No hinting path
+(`font.autoHint` is a no-op on FontForge 20251009). Works identically under
+`fontforge -script` and `python /usr/bin/python3.14`. See the dedicated section
+in `RECIPES.md`.
+
+#### `otf_optimize_ff-v1.0.py` / `otf_optimize_ff-v1.1.py` (FontForge + fontTools bridge)
+
+NOTE the naming: these **bridge variants** (renamed from `otf_optimize_ff-v2.0.py` /
+`otf_optimize_ff-v2.1.py`) pair the FontForge transform engine with a fontTools
+post-pass (GPOS PairPos rescale, CFF tuning). They are DIFFERENT from the
+hyphenated fontforge-only `otf_optimize-ff-v2.0.py` above. Prefer
+`otf_optimize-ff-v2.0.py` for pure FontForge, or the bridge variants when you
+need GPOS/CPOS correctness.
+
 #### `otf_optimize-v11.py` (legacy)
 
 Earlier version with `--widen` parameter for horizontal scaling. Superseded by v8.1's `--thickness` and v8.2's `--hint-tune`.
@@ -592,13 +612,19 @@ Earlier version with `--widen` parameter for horizontal scaling. Superseded by v
 
 ### "No module named 'fontforge'"
 
-FontForge Python bindings not installed. On Arch/Manjaro:
+FontForge Python bindings not installed (or not in this interpreter's path).
+On Arch/Manjaro the CLI and the Python module are **separate** packages:
 
 ```bash
-
-sudo pacman -S fontforge
-
+sudo pacman -S fontforge            # CLI / GUI
+sudo pacman -S python-fontforge     # the Python binding (this is the one you need)
 ```
+
+Note: the binding is specific to one CPython minor version. If you run the
+script with `/usr/bin/python3.14`, ensure `python-fontforge` was built against
+python3.14 (check `python3.14 -c "import fontforge"`). The script probes
+several known site-packages paths and stops cleanly with guidance if none
+match. `fontforge -script` also works as an alternative launcher.
 
 
 
@@ -946,13 +972,19 @@ Earlier version with `--widen` parameter for horizontal scaling. Superseded by v
 
 ### "No module named 'fontforge'"
 
-FontForge Python bindings not installed. On Arch/Manjaro:
+FontForge Python bindings not installed (or not in this interpreter's path).
+On Arch/Manjaro the CLI and the Python module are **separate** packages:
 
 ```bash
-
-sudo pacman -S fontforge
-
+sudo pacman -S fontforge            # CLI / GUI
+sudo pacman -S python-fontforge     # the Python binding (this is the one you need)
 ```
+
+Note: the binding is specific to one CPython minor version. If you run the
+script with `/usr/bin/python3.14`, ensure `python-fontforge` was built against
+python3.14 (check `python3.14 -c "import fontforge"`). The script probes
+several known site-packages paths and stops cleanly with guidance if none
+match. `fontforge -script` also works as an alternative launcher.
 
 
 

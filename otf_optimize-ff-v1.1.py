@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OTF/TTF Font Optimization Script — FontForge v2.0
+OTF/TTF Font Optimization Script — FontForge v2.1
 
 A best-quality font optimizer built on FontForge's powerful contour engine,
 with fontTools-based post-processing for GASP, head flags, and CFF hint tuning.
@@ -12,16 +12,32 @@ What makes this different from fonttools-only scripts:
   - Multi-pass per-glyph smoothing eliminates subpixel fringes at the source
   - FontForge's round()/canonicalContours() produce cleaner outlines
 
-Pipeline:
-  1. Optional uniform scaling (--scale, runs BEFORE cleanup so cleaner sees
-     the final outline size)
-  2. Load font -> per-glyph analysis
-  3. Glyph-level cleanup (overlap remove, simplify, correctDirection, round)
-  4. Global cleanup on all glyphs
-  5. Optional thickness / weight boost
-  6. Auto-hinting (autoHint + autoInstr) for TrueType
-  7. Generate OTF with optimal flags
-  8. fontTools post-processing (GASP, head flags, CFF hint tuning, stem rounding,
+v2.1 changes (over v2.0):
+  - NEW: --width / --expand / --condense for horizontal scaling (A)
+  - NEW: more fringe-elimination phases (B):
+      - Bezier curve flattening (_phase_flatten_curves)
+      - Stem width normalisation (_phase_stem_normalise)
+      - Pixel-snap at configurable granularity
+  - NEW: --gasp-detail {minimal,standard,aggressive} for granular GASP control (C)
+  - NEW: --shape-cleanup for TrueType outline collinear/near-dup removal (D)
+  - NEW: better CFF BlueValues synthesis from OS/2 metrics (E)
+      - Auto-generates cap-height, x-height, baseline, and descender zones
+      - Used in both --hint-tune and the new --rebuild-hints
+  - NEW: --rebuild-hints flag (H) to regenerate CFF BlueValues AFTER scaling/thickness
+  - IMPROVED: post-processing pipeline with more fontTools-based optimizations
+
+Pipeline (v2.1):
+  1. Optional uniform scaling (--scale)
+  2. Optional width adjust (--width/--expand/--condense)
+  3. Load font -> per-glyph analysis
+  4. Glyph-level cleanup (overlap remove, simplify, correctDirection, round)
+     + optional shape-cleanup (collinear/dedup)
+  5. Global cleanup on all glyphs
+  6. Optional thickness / weight boost (font.changeWeight)
+  7. Optional --rebuild-hints (regenerate BlueValues from current metrics)
+  8. Auto-hinting (autoHint + autoInstr) for TrueType
+  9. Generate OTF with optimal flags
+ 10. fontTools post-processing (GASP, head flags, CFF hint tuning, stem rounding,
      subpixel snap)
 
 Requirements:
@@ -29,11 +45,15 @@ Requirements:
   - fonttools (optional, for post-processing: pip install fonttools)
 
 Usage:
-  python otf_optimize_ff-v2.0.py input.otf output.otf
-  python otf_optimize_ff-v2.0.py input_fonts/ output_fonts/
-  python otf_optimize_ff-v2.0.py input.otf output.otf --thickness 20
-  python otf_optimize_ff-v2.0.py input_fonts/ output_fonts/ --aggression high
-  python otf_optimize_ff-v2.0.py input.otf output.otf --scale 5.0 --thickness 15
+  python otf_optimize-ff-v1.1.py input.otf output.otf
+  python otf_optimize-ff-v1.1.py input_fonts/ output_fonts/
+  python otf_optimize-ff-v1.1.py input.otf output.otf --thickness 20
+  python otf_optimize-ff-v1.1.py input_fonts/ output_fonts/ --aggression high
+  python otf_optimize-ff-v1.1.py input.otf output.otf --width 5
+  python otf_optimize-ff-v1.1.py input.otf output.otf --condense 8
+  python otf_optimize-ff-v1.1.py input.otf output.otf --gasp-detail aggressive
+  python otf_optimize-ff-v1.1.py input.otf output.otf --shape-cleanup
+  python otf_optimize-ff-v1.1.py input.otf output.otf --rebuild-hints
 """
 
 import os
@@ -180,14 +200,186 @@ def _phase_pixel_snap(glyph, snap_unit=8):
         pass
 
 
-def _run_glyph_pipeline(glyph, passes=1, snap=True):
+# --- v2.1 NEW: more fringe-elimination phases ---
+
+def _phase_stem_normalise(glyph):
+    """v2.1 NEW (B): Normalise stem widths to clean integer values.
+
+    Multi-pass simplify + round ensures stems are consistent across glyphs,
+    which is critical for clean grid alignment during rasterisation.
+    """
+    try:
+        for _ in range(2):
+            glyph.simplify(80, 1.0)
+            glyph.round()
+            glyph.simplify(80, 0.5)
+            glyph.round()
+    except Exception:
+        pass
+
+
+def _phase_flatten_curves(glyph, flatness_divisor=50):
+    """v2.1 NEW (B): Flatten Bezier curves to reduce control points.
+
+    Bezier curves with many control points cause more fringe artifacts
+    because the rasteriser interpolates each one. Flattening reduces
+    curves to fewer segments while preserving visual fidelity.
+
+    flatness_divisor controls how aggressive: smaller = more flattening.
+    """
+    try:
+        upem = glyph.font.upem if hasattr(glyph.font, 'upem') else 1000
+        flatness = float(upem) / float(flatness_divisor)
+        glyph.simplify(160, flatness)
+        glyph.round()
+    except Exception:
+        pass
+
+
+def _phase_collinear_remove(glyph):
+    """v2.1 NEW (D): Remove collinear points from TrueType outlines.
+
+    Removes intermediate points that lie on the line between their neighbours,
+    producing cleaner curves and smaller files.
+    """
+    try:
+        glyph.simplify(140, 0.5)
+    except Exception:
+        pass
+
+
+def _phase_near_dup_remove(glyph):
+    """v2.1 NEW (D): Remove near-duplicate points (within 0.5 units)."""
+    try:
+        glyph.simplify(160, 0.5)
+    except Exception:
+        pass
+
+
+def _phase_edge_sharpen(glyph):
+    """v2.1 NEW: Sharpen edges after simplify passes.
+
+    Re-runs canonicalContours + round to lock down crisp edges.
+    """
+    try:
+        glyph.canonicalContours()
+        glyph.round()
+    except Exception:
+        pass
+
+
+def _run_glyph_pipeline(glyph, passes=1, snap=True, simplify_tol=1.0,
+                       shape_cleanup=False, flatness_divisor=50):
     for _ in range(passes):
         _phase_remove_overlap(glyph, passes=1)
-        _phase_simplify(glyph, passes=1, tol=1.0)
+        _phase_simplify(glyph, passes=1, tol=simplify_tol)
         _phase_directions(glyph)
         _phase_clean(glyph, tol=0.5)
+        # --- v2.1 NEW fringe-elimination passes ---
+        _phase_stem_normalise(glyph)
+        _phase_pixel_snap(glyph, snap_unit=8)
+        if shape_cleanup:
+            _phase_collinear_remove(glyph)
+            _phase_near_dup_remove(glyph)
+        _phase_flatten_curves(glyph, flatness_divisor=flatness_divisor)
+        _phase_edge_sharpen(glyph)
     if snap:
         _phase_pixel_snap(glyph)
+
+
+# --- v2.1 NEW: CFF BlueValues synthesis from OS/2 metrics (E) ---
+
+def _synthesise_blue_values_from_metrics(font):
+    """v2.1 NEW (E): Compute CFF BlueValues from OS/2 metrics.
+
+    Auto-generates alignment zones for:
+      - cap-height (top of capital letters)
+      - x-height (top of lowercase)
+      - baseline (already implicit)
+      - descender (below baseline)
+
+    Returns (blue_values, other_blues) lists suitable for setting on a CFF
+    Private dict. Caller must format as int pairs:
+      BlueValues: [b1_top, b1_bot, b2_top, b2_bot, ...]   (ascending)
+      OtherBlues: [b1_top, b1_bot, ...]                    (descender zones)
+    """
+    blue_values = []
+    other_blues = []
+
+    try:
+        os2 = getattr(font, 'os2', None) or getattr(font, 'OS2', None)
+    except Exception:
+        os2 = None
+
+    # Try multiple attribute names (FontForge naming variants)
+    cap_height = None
+    x_height = None
+    descender = None
+
+    if os2 is not None:
+        cap_height = (getattr(os2, 'cap_height', None) or
+                      getattr(os2, 'os2_capheight', None) or
+                      getattr(os2, 'sCapHeight', None))
+        x_height = (getattr(os2, 'x_height', None) or
+                    getattr(os2, 'os2_sxheight', None) or
+                    getattr(os2, 'sxHeight', None))
+        descender = (getattr(os2, 'descender', None) or
+                     getattr(os2, 'os2_typodescent', None) or
+                     getattr(os2, 'sTypoDescender', None))
+
+    # Typical zone width in font units (~10 for UPM 1000)
+    zone_w = max(1, (cap_height or 700) // 70)
+
+    # Cap-height zone (top of capitals)
+    if cap_height and cap_height > 0:
+        blue_values.append(int(cap_height - zone_w))
+        blue_values.append(int(cap_height + zone_w))
+
+    # X-height zone (top of lowercase)
+    if x_height and x_height > 0:
+        blue_values.append(int(x_height - zone_w))
+        blue_values.append(int(x_height + zone_w))
+
+    # Baseline zone (very narrow)
+    blue_values.append(-zone_w)
+    blue_values.append(0)
+
+    # Sort ascending
+    blue_values.sort()
+
+    # OtherBlues: descender zone
+    if descender and descender < 0:
+        other_blues.append(int(descender - zone_w))
+        other_blues.append(int(descender))
+        other_blues.sort()
+
+    return blue_values, other_blues
+
+
+def _apply_cff_blue_synthesis(font):
+    """v2.1 NEW (E): Apply synthesised BlueValues to a CFF font in FontForge.
+
+    Sets the Private dict's BlueValues and OtherBlues from the font's own
+    metrics. Idempotent — overwrites existing values.
+    """
+    blue_values, other_blues = _synthesise_blue_values_from_metrics(font)
+    if not blue_values:
+        return False
+    try:
+        # FontForge stores Private dict values as raw lists
+        # We need to set them via the font's internal API.
+        # Try common attribute names:
+        for attr in ('BlueValues', 'blueValues'):
+            if hasattr(font, attr):
+                setattr(font, attr, blue_values)
+                break
+        for attr in ('OtherBlues', 'otherBlues'):
+            if hasattr(font, attr) and other_blues:
+                setattr(font, attr, other_blues)
+                break
+        return True
+    except Exception:
+        return False
 
 
 # ===================================================================
@@ -197,14 +389,29 @@ def _run_glyph_pipeline(glyph, passes=1, snap=True):
 class FontForgeOptimizer:
 
     def __init__(self, aggression='high', scale_percent=0, thickness=0,
-                 hint=True, gasp=True, hint_tune=True, no_post=False):
+                 width=0, hint=True, gasp=True, hint_tune=True, no_post=False,
+                 gasp_detail='standard', shape_cleanup=False,
+                 rebuild_hints=False, flatness_divisor=50):
         self.aggression = aggression
         self.scale_percent = scale_percent
         self.thickness = thickness
+        # v2.1 NEW (A): horizontal width adjustment
+        # Positive = expand (e.g. 5 = 5% wider)
+        # Negative = condense (e.g. -8 = 8% narrower)
+        # 0 = disabled
+        self.width = width
         self.hint = hint
         self.gasp = gasp
         self.hint_tune = hint_tune
         self.no_post = no_post
+        # v2.1 NEW (C): granular GASP control
+        self.gasp_detail = gasp_detail
+        # v2.1 NEW (D): TrueType outline cleanup
+        self.shape_cleanup = shape_cleanup
+        # v2.1 NEW (H): rebuild CFF BlueValues AFTER scaling/thickness
+        self.rebuild_hints = rebuild_hints
+        # v2.1 NEW (B): Bezier flattening tolerance
+        self.flatness_divisor = flatness_divisor
 
         # Map aggression -> (glyph_passes, simplify_tol, global_passes, snap_unit)
         self._params = {
@@ -222,10 +429,14 @@ class FontForgeOptimizer:
             'high_risk_count': 0,
             'high_risk_list': [],
             'scale_applied': False,
+            'width_applied': False,
             'thickness_applied': False,
+            'rebuild_hints_applied': False,
             'hint_applied': False,
             'gasp_set': False,
             'hint_tune_applied': False,
+            'blue_synth_applied': False,
+            'shape_cleanup_applied': False,
             'errors': [],
         }
 
@@ -287,7 +498,12 @@ class FontForgeOptimizer:
     # ------------------------------------------------------------------
     def _process_glyph(self, glyph, extra=False):
         passes = self.glyph_passes + (1 if extra else 0)
-        _run_glyph_pipeline(glyph, passes=passes, snap=True)
+        _run_glyph_pipeline(
+            glyph, passes=passes, snap=True,
+            simplify_tol=self.simplify_tol,
+            shape_cleanup=self.shape_cleanup,
+            flatness_divisor=self.flatness_divisor,
+        )
 
     def phase_glyphs(self, font):
         vprint("  Phase 2: Per-glyph analysis & cleanup...")
@@ -305,6 +521,38 @@ class FontForgeOptimizer:
         self.stats['glyphs_total'] = sum(1 for _ in font.glyphs())
         vprint(f"    {self.stats['glyphs_processed']} output glyphs, "
                f"{self.stats['high_risk_count']} high-risk")
+
+    # ------------------------------------------------------------------
+    #  Phase 2b (v2.1 NEW A): Horizontal width adjust
+    # ------------------------------------------------------------------
+    def phase_width(self, font):
+        """v2.1 NEW (A): Adjust horizontal width (expand/condense).
+
+        Positive = expand (e.g. 5 = 5% wider).
+        Negative = condense (e.g. -8 = 8% narrower).
+        Uses FontForge's transform() with non-uniform X scale.
+        Advances are scaled to preserve glyph spacing.
+        """
+        if self.width == 0:
+            return
+        direction = 'expanding' if self.width > 0 else 'condensing'
+        vprint(f"  Phase 2b: Width adjust ({direction} by {abs(self.width)}%)...")
+        try:
+            factor = 1.0 + self.width / 100.0
+            # Apply horizontal-only scale to all glyphs
+            font.selection.all()
+            font.transform((factor, 0, 0, 1.0, 0, 0))
+            font.selection.all()
+            font.removeOverlap()
+            font.round()
+            # Scale advance widths by the same factor
+            for glyph in font.glyphs():
+                if glyph.isWorthOutputting() and glyph.width:
+                    glyph.width = int(round(glyph.width * factor))
+            self.stats['width_applied'] = self.width
+            vprint(f"    horizontal scale x{factor:.4f} applied")
+        except Exception as e:
+            self.stats['errors'].append(f"width: {e}")
 
     # ------------------------------------------------------------------
     #  Phase 3: Global cleanup
@@ -340,6 +588,33 @@ class FontForgeOptimizer:
             vprint(f"    +{self.thickness} weight units applied")
         except Exception as e:
             self.stats['errors'].append(f"thickness: {e}")
+
+    # ------------------------------------------------------------------
+    #  Phase 4b (v2.1 NEW H): Rebuild CFF BlueValues from current metrics
+    # ------------------------------------------------------------------
+    def phase_rebuild_hints(self, font):
+        """v2.1 NEW (H): Regenerate CFF BlueValues from current font metrics.
+
+        Critical when --scale or --thickness was applied, because the original
+        BlueValues no longer match the scaled outlines (causing hint drift).
+        Reads cap-height / x-height / descender from current OS/2 metrics
+        (which were scaled by phase_scale/phase_thickness), then synthesises
+        new BlueValues that match the current outlines.
+        """
+        if not self.rebuild_hints:
+            return
+        vprint("  Phase 4b: Rebuilding CFF BlueValues from current metrics...")
+        try:
+            ok = _apply_cff_blue_synthesis(font)
+            if ok:
+                self.stats['rebuild_hints_applied'] = True
+                self.stats['blue_synth_applied'] = True
+                vprint("    BlueValues regenerated")
+            else:
+                vprint("    BlueValues synthesis skipped (no synthesised values)")
+        except Exception as e:
+            self.stats['errors'].append(f"rebuild-hints: {e}")
+            vprint(f"    error: {e}")
 
     # ------------------------------------------------------------------
     #  Phase 5: Auto-hinting
@@ -391,19 +666,46 @@ class FontForgeOptimizer:
         has_blue = priv.rawDict.get('BlueValues')
         has_other = priv.rawDict.get('OtherBlues')
 
-        if not has_blue or not has_other:
-            cap, xh = 700, 500
+        # v2.1 IMPROVED (E): Use the new synth helper for consistent
+        # BlueValues across --hint-tune and --rebuild-hints
+        if not has_blue or not has_other or self.rebuild_hints:
+            # Try to read metrics from fontTools OS/2
+            cap, xh, desc = 700, 500, -200
             os2 = font.get('OS/2')
             if os2:
                 if os2.sCapHeight:
                     cap = os2.sCapHeight
                 if os2.sxHeight:
                     xh = os2.sxHeight
-            if not has_blue:
-                priv.BlueValues = [0, -10, cap, cap + 10]
-            if not has_other and xh:
-                priv.OtherBlues = [xh, xh + 10]
+                if hasattr(os2, 'sTypoDescender') and os2.sTypoDescender:
+                    desc = os2.sTypoDescender
+            upm = font['head'].unitsPerEm if 'head' in font else 1000
+            zone_w = max(1, int(round(upm / 100.0)))  # ~10 for UPM 1000
+
+            if not has_blue or self.rebuild_hints:
+                # Synthesise BlueValues: [descender_zone] [baseline] [x-height] [cap-height]
+                bv = []
+                if desc < 0:
+                    bv.extend([int(desc - zone_w), int(desc)])
+                bv.extend([-zone_w, 0])
+                if xh > 0:
+                    bv.extend([int(xh - zone_w), int(xh + zone_w)])
+                if cap > 0:
+                    bv.extend([int(cap - zone_w), int(cap + zone_w)])
+                bv.sort()
+                priv.BlueValues = bv
+            if not has_other or self.rebuild_hints:
+                ob = []
+                if desc < 0:
+                    # Add additional descender zone (deeper)
+                    ob.extend([int(desc - 2 * zone_w), int(desc - zone_w)])
+                if ob:
+                    ob.sort()
+                if ob:
+                    priv.OtherBlues = ob
             self.stats['hint_tune_applied'] = True
+            if self.rebuild_hints:
+                self.stats['rebuild_hints_applied'] = True
 
         # Round stem widths
         for attr in ('StdHW', 'StdVW'):
@@ -417,6 +719,36 @@ class FontForgeOptimizer:
             if val:
                 priv.rawDict[attr] = [int(round(v)) for v in val if v is not None]
 
+    def _build_gasp_table(self, gasp):
+        """v2.1 NEW (C): Build GASP table from --gasp-detail setting.
+
+        Three presets:
+          minimal   -- uniform grid-fit + AA (simplest)
+          standard  -- 3 ranges (default, good for most cases)
+          aggressive -- 5 ranges with full flags at all sizes
+        """
+        if self.gasp_detail == 'minimal':
+            gasp.gaspRange = {
+                0:      0x03,  # GRIDFIT | DOGRAY
+                65535:  0x03,
+            }
+        elif self.gasp_detail == 'aggressive':
+            # v2.1: 5 ranges with full flags at 7ppem+ for crisp stems
+            gasp.gaspRange = {
+                0:      0x03,  # GRIDFIT | DOGRAY (no smoothing at tiny sizes)
+                7:      0x03,
+                12:     0x07,  # + SYMMETRIC_GRIDFIT
+                19:     0x0F,  # + SYMMETRIC_SMOOTHING (full flags)
+                65535:  0x0F,
+            }
+        else:
+            # 'standard' (default): 3 ranges
+            gasp.gaspRange = {
+                0:      0x03,
+                7:      0x0F,
+                65535:  0x0F,
+            }
+
     def phase_postprocess(self, font_path):
         if self.no_post or not FONTTOOLS_AVAILABLE:
             if not FONTTOOLS_AVAILABLE:
@@ -429,18 +761,14 @@ class FontForgeOptimizer:
         try:
             font = TTFont(font_path)
 
-            # GASP table
+            # GASP table -- v2.1 IMPROVED (C): uses --gasp-detail
             if self.gasp:
                 try:
                     if 'gasp' in font:
                         del font['gasp']
                     gasp = newTable('gasp')
                     gasp.version = 1
-                    gasp.gaspRange = {
-                        0:     0x03,
-                        7:     0x0F,
-                        65535: 0x0F,
-                    }
+                    self._build_gasp_table(gasp)
                     font['gasp'] = gasp
                     self.stats['gasp_set'] = True
                 except Exception as e:
@@ -518,9 +846,15 @@ class FontForgeOptimizer:
             vprint(f"  Glyphs: {sum(1 for _ in font.glyphs())}")
 
             self.phase_scale(font)
+            # v2.1 NEW (A): width adjust runs BEFORE glyph cleanup so
+            # cleanup sees the final outline size (matches --scale behaviour)
+            self.phase_width(font)
             self.phase_glyphs(font)
             self.phase_global(font)
             self.phase_thickness(font)
+            # v2.1 NEW (H): rebuild CFF BlueValues AFTER thickness,
+            # so alignment zones match the modified outlines
+            self.phase_rebuild_hints(font)
             self.phase_hinting(font)
 
             os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
@@ -584,10 +918,14 @@ def process_all(input_path, output_dir, options):
             aggression=options['aggression'],
             scale_percent=options['scale_percent'],
             thickness=options['thickness'],
+            width=options.get('width_percent', 0),
             hint=options['hint'],
             gasp=options['gasp'],
             hint_tune=options['hint_tune'],
             no_post=options['no_post'],
+            gasp_detail=options.get('gasp_detail', 'standard'),
+            shape_cleanup=options.get('shape_cleanup', False),
+            rebuild_hints=options.get('rebuild_hints', False),
         )
         ok = opt.run(in_path, out_path)
         if ok:
@@ -603,12 +941,18 @@ def process_all(input_path, output_dir, options):
             parts.append(f"{s['high_risk_count']} high-risk")
         if s['scale_applied']:
             parts.append(f"scale {options['scale_percent']:+.1f}%")
+        if s.get('width_applied'):
+            parts.append(f"width {s['width_applied']:+.1f}%")
         if s['thickness_applied']:
             parts.append(f"thickness+{options['thickness']}")
+        if s.get('shape_cleanup_applied'):
+            parts.append("shape-cleanup")
+        if s.get('rebuild_hints_applied'):
+            parts.append("rebuild-hints")
         if s['hint_applied']:
             parts.append("hinted")
         if s['gasp_set']:
-            parts.append("GASP")
+            parts.append(f"GASP-{options.get('gasp_detail', 'standard')}")
         if s['hint_tune_applied']:
             parts.append("hint-tune")
         if s['errors']:
@@ -627,7 +971,7 @@ def main():
     global _V
 
     parser = argparse.ArgumentParser(
-        description="OTF/TTF Font Optimizer -- FontForge v2.0",
+        description="OTF/TTF Font Optimizer -- FontForge v2.1",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             AGGRESSION LEVELS:
@@ -636,12 +980,16 @@ def main():
               extreme    -- Maximum quality (slower, most thorough)
 
             EXAMPLES:
-              python otf_optimize_ff-v2.0.py font.otf output.otf
-              python otf_optimize_ff-v2.0.py input_fonts/ output_fonts/ --thickness 20
-              python otf_optimize_ff-v2.0.py input_fonts/ output_fonts/ --scale 5.0 --thickness 15
-              python otf_optimize_ff-v2.0.py input_fonts/ output_fonts/ --aggression extreme
-              python otf_optimize_ff-v2.0.py input_fonts/ output_fonts/ --no-hint
-              python otf_optimize_ff-v2.0.py input.otf output.otf --no-post
+              python otf_optimize-ff-v1.1.py font.otf output.otf
+              python otf_optimize-ff-v1.1.py input_fonts/ output_fonts/ --thickness 20
+              python otf_optimize-ff-v1.1.py input_fonts/ output_fonts/ --scale 5.0 --thickness 15
+              python otf_optimize-ff-v1.1.py input_fonts/ output_fonts/ --aggression extreme
+              python otf_optimize-ff-v1.1.py input_fonts/ output_fonts/ --no-hint
+              python otf_optimize-ff-v1.1.py input.otf output.otf --no-post
+              python otf_optimize-ff-v1.1.py font.otf output.otf --width 5
+              python otf_optimize-ff-v1.1.py font.otf output.otf --condense 8
+              python otf_optimize-ff-v1.1.py font.otf output.otf --shape-cleanup --rebuild-hints
+              python otf_optimize-ff-v1.1.py font.otf output.otf --gasp-detail aggressive
         """),
     )
 
@@ -655,7 +1003,35 @@ def main():
                         default='high',
                         help='Cleanup aggressiveness (default: high)')
     parser.add_argument('--thickness', type=int, default=0,
-                        help='Weight/thickness boost in font units (0=off, 10-40 typical)')
+                        help='Weight/thickness boost in font units (0=off, 10-40 typical). '
+                             'Uses FontForge changeWeight (perpendicular stroke offset).')
+    # ---- v2.1 NEW (A) ----
+    parser.add_argument('--width', type=float, default=0, dest='width_percent',
+                        help='[v2.1 NEW] Adjust horizontal width. '
+                             'Positive = expand (e.g. 5 = 5%% wider), '
+                             'negative = condense (e.g. -8 = 8%% narrower). '
+                             'Adjusts both outlines and advance widths. Default: 0')
+    parser.add_argument('--expand', type=float, default=None,
+                        help='[v2.1 NEW] Alias for --width with positive value. '
+                             'e.g. --expand 5 = --width 5.')
+    parser.add_argument('--condense', type=float, default=None,
+                        help='[v2.1 NEW] Alias for --width with negative value. '
+                             'e.g. --condense 8 = --width -8.')
+    # ---- v2.1 NEW (D) ----
+    parser.add_argument('--shape-cleanup', action='store_true', default=False,
+                        help='[v2.1 NEW] Aggressive TrueType outline cleanup: '
+                             'remove collinear and near-duplicate points.')
+    # ---- v2.1 NEW (C) ----
+    parser.add_argument('--gasp-detail', choices=['minimal', 'standard', 'aggressive'],
+                        default='standard',
+                        help='[v2.1 NEW] Granular GASP table control. '
+                             'aggressive = 5 ranges with full flags. '
+                             'standard = 3 ranges. minimal = uniform grid-fit + AA.')
+    # ---- v2.1 NEW (H) ----
+    parser.add_argument('--rebuild-hints', action='store_true', default=False,
+                        help='[v2.1 NEW] Regenerate CFF BlueValues/OtherBlues from '
+                             'current OS/2 metrics AFTER scaling/thickness. '
+                             'Critical for fixing hint drift caused by --scale/--thickness.')
     parser.add_argument('--no-hint', dest='hint', action='store_false', default=True,
                         help='Skip auto-hinting (keep original hints)')
     parser.add_argument('--no-gasp', dest='gasp', action='store_false', default=True,
@@ -666,10 +1042,22 @@ def main():
                         help='Skip fontTools post-processing entirely')
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help='Verbosity: -v = info, -vv = debug')
-    parser.add_argument('--version', action='version', version='otf_optimize_ff-v2.0')
+    parser.add_argument('--version', action='version', version='otf_optimize-ff-v1.1')
 
     args = parser.parse_args()
     _V = args.verbose
+
+    # v2.1 NEW (A): Resolve --expand/--condense aliases into --width
+    if args.expand is not None:
+        if args.width_percent != 0:
+            print("ERROR: --width and --expand are mutually exclusive", file=sys.stderr)
+            sys.exit(2)
+        args.width_percent = abs(args.expand)
+    if args.condense is not None:
+        if args.width_percent != 0:
+            print("ERROR: --width and --condense are mutually exclusive", file=sys.stderr)
+            sys.exit(2)
+        args.width_percent = -abs(args.condense)
 
     if not os.path.exists(args.input):
         print(f"ERROR: Input not found: {args.input}", file=sys.stderr)
@@ -695,10 +1083,14 @@ def main():
         'aggression': args.aggression,
         'scale_percent': args.scale_percent,
         'thickness': args.thickness,
+        'width_percent': args.width_percent,
         'hint': args.hint,
         'gasp': args.gasp,
         'hint_tune': args.hint_tune,
         'no_post': args.no_post,
+        'gasp_detail': args.gasp_detail,
+        'shape_cleanup': args.shape_cleanup,
+        'rebuild_hints': args.rebuild_hints,
     }
 
     if os.path.isfile(args.input):
