@@ -62,6 +62,14 @@ except ImportError:
     FONTTOOLS_AVAILABLE = False
 
 
+# Smallest hole (in font units) that Phase 5's counter shrink is allowed to
+# leave behind. Below this a counter is visually closed: at UPM 1000, 20u is
+# 1/3 of a pixel at 16ppem, so a smaller hole reads as solid. Phase 5
+# measures each counter after shrinking and restores it when it would fall
+# under this, which is what stops 'R'/'B'/'P' bowls from filling in.
+COUNTER_MIN_UNITS = 20
+
+
 # ---------------------------------------------------------------------------
 #  Per-glyph fringe analysis
 # ---------------------------------------------------------------------------
@@ -184,6 +192,7 @@ class FringeKiller:
             'fringe_issues': [],
             'thickness_applied': False,
             'compact_applied': False,
+            'counters_guarded': 0,
             'width_applied': 0,
             'gasp_set': False,
             'hint_tune_applied': False,
@@ -529,33 +538,66 @@ class FringeKiller:
                 glyph.width = int(w * (100 - width_reduction) / 100)
 
         # Shrink inner contours (counter spaces)
+        #
+        # COUNTER GUARD: this phase used to shrink every inner contour with
+        # no check, which closes tight holes outright -- the classic "R's
+        # bowl is filled" symptom. Two fixes:
+        #   1. int() truncation was a hidden bias. FontForge coords are
+        #      integers after round(), so int() moved every point toward
+        #      zero, eroding counters asymmetrically by up to 1u per point
+        #      even for a negligible shrink. round() is unbiased.
+        #   2. Measure the counter before and after; if a hole collapses
+        #      below COUNTER_MIN_UNITS, restore that contour and count it.
         for glyph in font.glyphs():
             contours = glyph.foreground
             if len(contours) < 2:
                 continue
-            # Identify the outer (largest) contour
+            # Identify the outer (largest) contour. Use ON-CURVE points only:
+            # iterating a contour also yields off-curve control points, so a
+            # plain shoelace over them is not the outline area.
             areas = []
             for contour in contours:
-                pts = [(p.x, p.y) for p in contour]
-                n = len(pts)
+                on = [p for p in contour if p.on_curve]
                 area = 0
+                n = len(on)
                 for i in range(n):
-                    x1, y1 = pts[i]
-                    x2, y2 = pts[(i + 1) % n]
+                    x1, y1 = on[i].x, on[i].y
+                    x2, y2 = on[(i + 1) % n].x, on[(i + 1) % n].y
                     area += x1 * y2 - x2 * y1
                 areas.append(abs(area))
+            if not areas or max(areas) <= 0:
+                continue
             outer_idx = areas.index(max(areas))
+
             for i, contour in enumerate(contours):
                 if i == outer_idx:
                     continue
-                pts = list(contour)
-                xs = [p.x for p in pts]
-                ys = [p.y for p in pts]
+                # Save exact original coords so we can restore on collapse.
+                original = [(p.x, p.y) for p in contour]
+                xs = [x for x, _ in original]
+                ys = [y for _, y in original]
                 cx = (min(xs) + max(xs)) / 2
                 cy = (min(ys) + max(ys)) / 2
-                for p in pts:
-                    p.x = int(p.x + (cx - p.x) * shrink_pct)
-                    p.y = int(p.y + (cy - p.y) * shrink_pct)
+                for p in contour:
+                    p.x = int(round(p.x + (cx - p.x) * shrink_pct))
+                    p.y = int(round(p.y + (cy - p.y) * shrink_pct))
+
+                # Did this counter survive?
+                nxs = [p.x for p in contour]
+                nys = [p.y for p in contour]
+                w = max(nxs) - min(nxs)
+                h = max(nys) - min(nys)
+                if w <= COUNTER_MIN_UNITS or h <= COUNTER_MIN_UNITS:
+                    for p, (ox, oy) in zip(contour, original):
+                        p.x, p.y = ox, oy
+                    self.stats['counters_guarded'] = \
+                        self.stats.get('counters_guarded', 0) + 1
+                    if self.verbose:
+                        self._log(
+                            f"  counter guard: kept hole open in "
+                            f"{glyph.glyphname} "
+                            f"({w:.0f}x{h:.0f}u would have collapsed)",
+                            'sub')
 
         font.selection.all()
         font.removeOverlap()
