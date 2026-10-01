@@ -103,7 +103,11 @@ def analyze_glyph(glyph):
             score += 30
             problems.append('overlaps')
 
-        contours = list(glyph.contours) if hasattr(glyph, 'contours') else []
+        # glyph.contours does not exist on FontForge 20251009. The old
+        # hasattr guard yielded [] and scored EVERY glyph as 'clean', so
+        # no glyph ever received targeted fringe treatment. foreground
+        # yields point objects; snapshot them as tuples for the loop below.
+        contours = [[(p.x, p.y) for p in c] for c in glyph.foreground]
         if not contours:
             return {'score': 0, 'problems': []}
 
@@ -222,7 +226,7 @@ class FringeKiller:
         tol = self._tol
         for _ in range(self._passes):
             try:
-                glyph.simplify(160, tol)
+                glyph.simplify(tol)
                 glyph.round()
             except Exception:
                 break
@@ -241,8 +245,8 @@ class FringeKiller:
         """Remove tiny segments and stray points."""
         try:
             tol = self._tol * 0.5
-            glyph.simplify(100, tol)
-            glyph.clean()
+            glyph.simplify(tol)
+
         except Exception:
             pass
 
@@ -250,7 +254,7 @@ class FringeKiller:
         """Aggressive collinear-point removal."""
         try:
             for _ in range(self._passes):
-                glyph.simplify(140, 0.3 if self.aggression == 'extreme' else 0.5)
+                glyph.simplify(0.3 if self.aggression == 'extreme' else 0.5)
         except Exception:
             pass
 
@@ -282,14 +286,44 @@ class FringeKiller:
             # This is fine enough for smooth AA while preventing subpixel fringes
             snap_unit = 8
 
-            for contour in glyph.contours:
-                for i in range(len(contour)):
-                    x, y = contour[i][0], contour[i][1]
-                    # Round to nearest snap_unit
-                    nx = int(round(x / snap_unit) * snap_unit)
-                    ny = int(round(y / snap_unit) * snap_unit)
-                    if (nx, ny) != (x, y):
-                        contour[i] = (nx, ny)
+            # glyph.contours does not exist on FontForge 20251009, so this
+            # whole phase has NEVER RUN. Activating it is a real behaviour
+            # change: an 8-unit snap on every coordinate. Counters are the
+            # casualty risk -- a narrow hole can be pinched shut by rounding
+            # its two sides toward each other -- so each inner contour is
+            # measured before/after and restored if it collapses.
+            contours = list(glyph.foreground)
+            if len(contours) < 2:
+                inner_idx = set()
+            else:
+                areas = []
+                for c in contours:
+                    on = [p for p in c if p.on_curve]
+                    a = 0.0
+                    n = len(on)
+                    for i in range(n):
+                        a += on[i].x * on[(i + 1) % n].y
+                        a -= on[(i + 1) % n].x * on[i].y
+                    areas.append(abs(a))
+                inner_idx = {i for i in range(len(contours))
+                             if i != areas.index(max(areas))} if areas else set()
+
+            for ci, contour in enumerate(contours):
+                original = [(p.x, p.y) for p in contour]
+                for p in contour:
+                    nx = int(round(p.x / snap_unit) * snap_unit)
+                    ny = int(round(p.y / snap_unit) * snap_unit)
+                    p.x, p.y = nx, ny
+                if ci in inner_idx:
+                    xs = [p.x for p in contour]
+                    ys = [p.y for p in contour]
+                    w = max(xs) - min(xs)
+                    h = max(ys) - min(ys)
+                    if w <= COUNTER_MIN_UNITS or h <= COUNTER_MIN_UNITS:
+                        for p, (ox, oy) in zip(contour, original):
+                            p.x, p.y = ox, oy
+                        self.stats['counters_guarded'] = \
+                            self.stats.get('counters_guarded', 0) + 1
         except Exception:
             pass
 
@@ -302,7 +336,7 @@ class FringeKiller:
         """
         try:
             for tol in [0.8, 0.5, 0.3, 0.1]:
-                glyph.simplify(140, tol)
+                glyph.simplify(tol)
                 glyph.round()
                 glyph.removeOverlap()
         except Exception:
@@ -317,10 +351,10 @@ class FringeKiller:
         """
         try:
             # Simplify to remove tiny stem variations, then round
-            glyph.simplify(80, 1.0)
+            glyph.simplify(1.0)
             glyph.round()
             # Second pass at tighter tolerance
-            glyph.simplify(80, 0.5)
+            glyph.simplify(0.5)
             glyph.round()
         except Exception:
             pass
@@ -340,39 +374,21 @@ class FringeKiller:
             flatness = getattr(self, '_quantise_curve', 50)
             upem = glyph.font.upem if hasattr(glyph.font, 'upem') else 1000
             tolerance = upem / float(flatness)
-            glyph.simplify(160, tolerance)
+            glyph.simplify(tolerance)
             glyph.round()
         except Exception:
             pass
 
     def _phase_stem_align(self, glyph):
-        """
-        Align stems with reference glyphs (v5 NEW).
+        """Align stems with reference glyphs (v5 NEW) -- UNAVAILABLE.
 
-        Uses FontForge's alignPointsToReference to ensure horizontal and
-        vertical stem positions match across similar glyphs (e.g., 'o', 'O',
-        'n', 'p'). Consistent stem alignment is critical for visual rhythm
-        and fringe-free rendering.
-
-        Skipped if no reference glyphs exist (e.g., for '.notdef').
+        This called glyph.alignPointsToReference(), which does not exist in
+        FontForge 20251009. Both calls sat inside `except Exception: pass`,
+        so the phase has never done anything on this build. Removed rather
+        than reimplemented: hand-rolling cross-glyph stem alignment is a
+        geometry change of its own and needs its own validation.
         """
-        try:
-            # Try to align with 'O' (uppercase O) as reference if it exists
-            if glyph.glyphname != 'O' and 'O' in glyph.font:
-                try:
-                    ref = glyph.font['O']
-                    glyph.alignPointsToReference(ref, 4)  # Round to 4 units
-                except Exception:
-                    pass
-            # Also align with 'o' (lowercase o)
-            if glyph.glyphname != 'o' and 'o' in glyph.font:
-                try:
-                    ref = glyph.font['o']
-                    glyph.alignPointsToReference(ref, 4)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        return
 
     def _phase_bezier_integrity(self, glyph):
         """
@@ -386,7 +402,7 @@ class FringeKiller:
         """
         try:
             for tol in [0.5, 0.3, 0.1]:
-                glyph.simplify(160, tol)
+                glyph.simplify(tol)
                 glyph.removeOverlap()
                 glyph.canonicalContours()
         except Exception:
@@ -403,7 +419,7 @@ class FringeKiller:
             return
         try:
             for tol in [0.8, 0.5, 0.3, 0.1]:
-                glyph.simplify(140, tol)
+                glyph.simplify(tol)
                 glyph.removeOverlap()
                 glyph.canonicalContours()
                 glyph.round()
@@ -488,13 +504,13 @@ class FringeKiller:
             if self.aggression in ('high', 'extreme'):
                 font.selection.all()
                 font.removeOverlap()
-                font.simplify(160, 0.5)
+                font.simplify(0.5)
                 font.canonicalContours()
                 # v4.1: extra global pass at extreme for maximum cleanup
                 if self.aggression == 'extreme':
                     font.selection.all()
                     font.removeOverlap()
-                    font.simplify(120, 0.3)
+                    font.simplify(0.3)
                     font.canonicalContours()
                     font.round()
         except Exception as e:
@@ -640,8 +656,13 @@ class FringeKiller:
         if not self.stats['fringe_issues'] or self.aggression not in ('high', 'extreme'):
             return
         self._log("Phase 6: High-risk glyph re-pass (extreme)", 'phase')
-        # Top 20 high-risk glyphs
-        for name, _ in self.stats['fringe_issues'][:20]:
+        # Top 20 high-risk glyphs. fringe_issues entries are 3-tuples
+        # (name, score, problems) as built in phase_glyphs; this loop unpacked
+        # 2 and raised ValueError. It was unreachable before the fringe
+        # detector was repaired -- glyph.contours does not exist on FontForge
+        # 20251009, so every glyph scored 0 and the list stayed empty.
+        for entry in self.stats['fringe_issues'][:20]:
+            name = entry[0]
             try:
                 glyph = font[name]
                 self._phase_overlap(glyph)
@@ -652,7 +673,7 @@ class FringeKiller:
         if self.aggression == 'extreme':
             font.selection.all()
             font.removeOverlap()
-            font.simplify(120, 0.2)
+            font.simplify(0.2)
             font.canonicalContours()
 
     # -- Phase 7: hinting --
