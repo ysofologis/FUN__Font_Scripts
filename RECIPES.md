@@ -351,6 +351,35 @@ names the interpreter to use.
 | `--hint MODE` | Autohint output as the LAST step | `auto` picks by format; `cff`→otfautohint, `tt`→ttfautohint, `none`=off. FontForge's own autoHint is a no-op on 20251009, so an external binary does it. |
 | `-j N` | Parallel workers | 0 = auto (per CPU, capped at font count). |
 
+### ttf2otf_ff_v6.0 — `--scale` and `--spacing`
+
+`ttf2otf_ff_v6.py` is the v5 script renamed in place, with two new flags:
+
+| Flag | Effect | Notes |
+|------|--------|-------|
+| `--scale PCT` | Uniform X-and-Y scale (geometry **and** advance widths) | Distinct from `--width`, which is X-only. `font.transform((s,0,0,s,0,0))` then `glyph.width *= s`. Refuses factors <= 0 (would invert the font). |
+| `--spacing PCT` | Letter-spacing: % change to advance widths | Same semantics as `otf_optimize-ff-v2.0.py --spacing`: outlines never move, zero-width glyphs skipped. |
+
+Pipeline order (v5 → v6):
+
+```
+5  phase_compact    (--compact)
+5b phase_width      (--width)
+5c phase_scale      (--scale)         ← new
+5d phase_spacing    (--spacing)       ← new
+6  phase_high_risk_repass
+```
+
+Both new flags default to 0 (no-op) so v5 invocations keep behaving identically. Verified on RoadUA-Black (639 glyphs):
+
+| run | log evidence | output |
+|-----|--------------|--------|
+| `--scale 5` | `Phase 5c: Uniform scale ×1.0500 (+5%)` | 639 glyphs, 93,216 B |
+| `--spacing 10` | `Phase 5d: Letter-spacing +10%` — `638 touched, 1 skipped (zero-width preserved)` | 639 glyphs, 84,716 B |
+| `--scale 5 --spacing 10` | both phases run in order | 639 glyphs, 93,232 B |
+
+The `1 skipped (zero-width preserved)` is a combining mark whose width stayed at 0 — exactly the behaviour documented in the help text, and exactly the bug class this guard was added for.
+
 ### Verified limits & behaviour
 
 - **Stem is measured from outlines**, never guessed. Jano Sans Pro Regular: 88u

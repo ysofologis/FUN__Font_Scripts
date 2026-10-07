@@ -496,6 +496,7 @@ All Chrome-breaking issues have been fixed:
 | **ff-v2.1** | FontForge-based equivalent of v8.x. v2.0 → v2.1 added: `--width/--expand/--condense` for horizontal scaling (A), fringe-elimination phases (B): `_phase_stem_normalise`, `_phase_flatten_curves`, `_phase_collinear_remove`, etc., `--gasp-detail {minimal,standard,aggressive}` (C), `--shape-cleanup` (D), better CFF BlueValues synthesis from OS/2 metrics (E), `--rebuild-hints` flag (H). (Hinting note: FontForge `autoHint` is a no-op on 20251009.) |
 
 | **ttf2otf_ff_v5** | Fringe elimination specialist (FontForge). v4 → v5 added: `--width` for horizontal expand/condense, `--quantise-curve` for Bezier flattening, `--blue-quantise` for BlueValues grid rounding, `_phase_flatten_curves`, `_phase_stem_align`, `_phase_bezier_integrity`, `_phase_extra_global`, `_phase_quantise_blue_values`. More aggressive anti-fringe passes per glyph. |
+| **ttf2otf_ff_v6** | Same as v5, plus two new flags: `--scale N` (uniform X+Y scale of geometry **and** advance widths, distinct from X-only `--width`; refuses factors <= 0) and `--spacing N` (letter-spacing as a percent change of advance widths; outlines untouched, zero-width glyphs skipped). Pipeline slots 5c and 5d added between 5b (`--width`) and 6 (high-risk re-pass). Bumps `--version` / banner from v5.0 to v6.0; everything else identical. |
 
 
 

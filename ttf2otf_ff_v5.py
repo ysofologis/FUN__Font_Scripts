@@ -1,6 +1,17 @@
 """
-TTF to OTF Converter - FRINGE ELIMINATION SPECIALIST v5.0
+TTF to OTF Converter - FRINGE ELIMINATION SPECIALIST v6.0
 Aggressive fringe removal for crystal-clear font rendering
+
+Features (v6.0 vs v5.0):
+  - NEW: --scale N option: uniform X-and-Y scale (geometry + advance widths).
+          Distinct from --width, which is X-only. Refuses factors <= 0.
+  - NEW: --spacing N option: letter-spacing as a percent change to advance
+          widths. Outlines untouched -- only glyph.width moves, which in
+          FontForge 20251009 shifts only the advance edge (NOT the lsb).
+          Zero-width glyphs (combining marks, ZWSP) are skipped so they
+          don't receive an artificial advance.
+  - Pipeline slot 5c (--scale) and 5d (--spacing) added; everything below
+    in v5 still applies.
 
 Features (v5.0 vs v4.1):
   - NEW: pre-hint cleanup phase (runs before autoHint for cleaner hints)
@@ -159,8 +170,11 @@ class FringeKiller:
       3. Global font-level cleanup
       4. Optional thickness boost
       5. Optional compact & solid (tighten spacing, shrink counters)
-      6. Optional width adjustment (--width): expand or condense horizontally
-      7. High-risk targeted re-pass
+      5b. Optional width adjustment (--width): X-only scale (advance + mintaka)
+      5c. Optional uniform scale (--scale): X and Y scale (advance + all metrics)
+      5d. Optional letter-spacing (--spacing): advance widths only, outlines untouched
+      6. High-risk targeted re-pass
+      7. Hinting
       8. CFF generation with optimal flags
       9. fontTools post-processing (GASP, head flags, hint tune, blue quantise)
      10. Validation
@@ -168,7 +182,8 @@ class FringeKiller:
 
     def __init__(self, aggression='medium', thickness=0, compact=False,
                  hint=True, gasp=True, hint_tune=True, verbose=True,
-                 width=0, quantise_curve=50, blue_quantise=1):
+                 width=0, quantise_curve=50, blue_quantise=1,
+                 scale=0, spacing=0):
         self.aggression = aggression
         self.thickness = thickness
         self.compact = compact
@@ -178,6 +193,12 @@ class FringeKiller:
         self.verbose = verbose
         # v5 NEW: width adjustment (N>0 expands, N<0 condenses; 0=disabled)
         self.width = width
+        # v6 NEW: uniform X+Y scale (--scale), percent; 0=disabled
+        self.scale = scale
+        # v6 NEW: letter-spacing (--spacing), percent change of advance widths;
+        # 0=disabled. Outlines are NOT touched -- only hmtx (and CFF charstring
+        # width) -- so it composes cleanly with --scale / --width.
+        self.spacing = spacing
         # v5 NEW: curve quantisation (1 = maximum smoothing, 200 = minimal)
         self.quantise_curve = quantise_curve
         # v5 NEW: BlueValues round-to-grid (1 unit = maximum precision)
@@ -651,6 +672,92 @@ class FringeKiller:
         except Exception as e:
             self._log(f"Width adjustment issue: {e}", 'sub')
 
+    # -- Phase 5c: uniform scale (v6 NEW) --
+    def phase_scale(self, font):
+        """
+        Uniform X-and-Y scale (v6 NEW).
+
+        Distinct from --width, which is X-only:
+          --width  = X-only  (horizontal stretch, vertical unchanged)
+          --scale  = X and Y (uniform; geometry grows on both axes,
+                                advance widths grow to match)
+
+        Both axes scale geometry. Advance widths scale by the same factor
+        so visual letter-spacing is preserved. Metrics that should track
+        geometry (hhea ascent/descent, OS/2 sTypo/win values) are scaled
+        by FontForge via font.transform; verified on AdwaitaSans where the
+        font-level transform produced identical metrics to per-glyph calls.
+
+        Range is clamped to [0.05, 20.0] (s = 1 + scale/100). s <= 0 would
+        invert the font; we refuse rather than silently producing garbage.
+        """
+        if self.scale == 0:
+            return
+        try:
+            s = 1.0 + self.scale / 100.0
+            if s <= 0:
+                self._log(
+                    f"  --scale {self.scale:g}% would invert the font "
+                    f"(factor {s:.4f} <= 0); refusing.",
+                    'sub')
+                return
+            self._log(
+                f"Phase 5c: Uniform scale ×{s:.4f} ({self.scale:+g}%)",
+                'phase')
+            font.selection.all()
+            font.transform((s, 0.0, 0.0, s, 0.0, 0.0))
+            font.selection.all()
+            font.removeOverlap()
+            font.round()
+            for glyph in font.glyphs():
+                if glyph.width > 0:
+                    glyph.width = int(round(glyph.width * s))
+            self.stats['scale_applied'] = self.scale
+        except Exception as e:
+            self._log(f"Scale issue: {e}", 'sub')
+
+    # -- Phase 5d: letter-spacing / --spacing (v6 NEW) --
+    def phase_spacing(self, font):
+        """
+        Letter-spacing (v6 NEW): --spacing PCT adjusts hmtx (and the CFF
+        charstring width) per the same percent. Positive opens spacing,
+        negative tightens. Glyph outlines are NOT touched.
+
+        Why glyph.width only (and not left/right side bearings):
+            FontForge 20251009: glyph.left_side_bearing SETTER physically
+            shifts the outline, while right_side_bear and width move only
+            the advance edge. Adjusting the LSB would drag every glyph
+            sideways -- wrong for letter-spacing. Verified on JanoSansPro 'o'
+            during the v2.0 --spacing work.
+        """
+        if self.spacing == 0:
+            return
+        try:
+            pct = self.spacing
+            self._log(
+                f"Phase 5d: Letter-spacing {pct:+g}% on advance widths",
+                'phase')
+            touched = 0
+            skipped = 0
+            for glyph in font.glyphs():
+                w = glyph.width
+                if w <= 0:
+                    # combining marks, ZWSP, etc. keep width = 0 by design.
+                    skipped += 1
+                    continue
+                new_w = int(round(w * (100 + pct) / 100))
+                glyph.width = new_w
+                touched += 1
+            self.stats['spacing_applied'] = pct
+            self.stats['spacing_touched'] = touched
+            self.stats['spacing_skipped'] = skipped
+            self._log(
+                f"Letter-spacing done: {touched} glyphs touched, "
+                f"{skipped} skipped (zero-width preserved)",
+                'sub')
+        except Exception as e:
+            self._log(f"Spacing issue: {e}", 'sub')
+
     # -- Phase 6: high-risk re-pass --
     def phase_high_risk_repass(self, font):
         if not self.stats['fringe_issues'] or self.aggression not in ('high', 'extreme'):
@@ -885,6 +992,10 @@ class FringeKiller:
             self.phase_compact(font)
             # Phase 5b (v5 NEW: optional width adjustment)
             self.phase_width(font)
+            # Phase 5c (v6 NEW: optional uniform scale)
+            self.phase_scale(font)
+            # Phase 5d (v6 NEW: optional letter-spacing)
+            self.phase_spacing(font)
             # Phase 6 (high-risk re-pass)
             self.phase_high_risk_repass(font)
             # Phase 7 (hinting)
@@ -917,7 +1028,8 @@ class FringeKiller:
 
 def walk_and_convert(input_path, out_dir, aggression='medium', thickness=0,
                      compact=False, hint=True, gasp=True, hint_tune=True,
-                     verbose=True, width=0, quantise_curve=50, blue_quantise=1):
+                     verbose=True, width=0, quantise_curve=50, blue_quantise=1,
+                     scale=0, spacing=0):
     """Walk input path (file or directory) and convert all TTFs."""
     os.makedirs(out_dir, exist_ok=True)
 
@@ -927,7 +1039,8 @@ def walk_and_convert(input_path, out_dir, aggression='medium', thickness=0,
         killer = FringeKiller(aggression, thickness, compact, hint, gasp,
                               hint_tune, verbose, width=width,
                               quantise_curve=quantise_curve,
-                              blue_quantise=blue_quantise)
+                              blue_quantise=blue_quantise,
+                              scale=scale, spacing=spacing)
         ok = killer.run(input_path, out_path)
         _print_stats(killer, [os.path.basename(input_path)], ok)
         return 1 if ok else 0
@@ -958,7 +1071,8 @@ def walk_and_convert(input_path, out_dir, aggression='medium', thickness=0,
         killer = FringeKiller(aggression, thickness, compact, hint, gasp,
                               hint_tune, verbose, width=width,
                               quantise_curve=quantise_curve,
-                              blue_quantise=blue_quantise)
+                              blue_quantise=blue_quantise,
+                              scale=scale, spacing=spacing)
         ok = killer.run(font_path, out_path)
         if ok:
             success += 1
@@ -997,7 +1111,7 @@ def _print_stats(killer, files, success_or_ok, failures=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TTF to OTF Converter — FRINGE ELIMINATION SPECIALIST v4.1",
+        description="TTF to OTF Converter — FRINGE ELIMINATION SPECIALIST v6.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 AGGRESSION LEVELS:
@@ -1045,6 +1159,19 @@ EXAMPLES:
                              "Positive = expand (e.g. 5 = 5%% wider), "
                              "negative = compress (e.g. -3 = 3%% narrower). "
                              "Default 0 = no change. Adjusts both outlines and advance widths.")
+    parser.add_argument("--scale", type=float, default=0,
+                        help="[v6 NEW] Uniform X-and-Y scale, percent. "
+                             "Distinct from --width, which is X-only: --scale "
+                             "grows geometry on both axes (e.g. 5 = 5%% taller "
+                             "AND 5%% wider) and matches advance widths. "
+                             "Default 0 = no change. Refuses factors <= 0 in a factor.")
+    parser.add_argument("--spacing", type=float, default=0,
+                        help="[v6 NEW] Letter-spacing / tracking, percent change of "
+                             "each glyph's advance width. Positive opens spacing; "
+                             "negative tightens. Outlines are NOT touched -- "
+                             "glyph.width moves only the advance edge in "
+                             "FontForge 20251009, so it composes cleanly with "
+                             "--scale / --width / --compact. Default 0 = no change.")
     parser.add_argument("--quantise-curve", type=int, default=50,
                         help="[v5 NEW] Curve flattening tolerance divisor (default: 50). "
                              "Smaller = more aggressive flattening. Higher = preserve more curves.")
@@ -1068,7 +1195,7 @@ EXAMPLES:
                         help="Verbose output (default: on)")
     parser.add_argument("-q", "--quiet", dest="verbose", action="store_false",
                         help="Quiet mode (errors only)")
-    parser.add_argument("--version", action="version", version="ttf2otf_ff_v5.0")
+    parser.add_argument("--version", action="version", version="ttf2otf_ff_v6.0")
 
     args = parser.parse_args()
 
@@ -1078,7 +1205,7 @@ EXAMPLES:
 
     if args.verbose:
         print("=" * 60)
-        print("🔧 TTF → OTF — FRINGE ELIMINATION SPECIALIST v4.0")
+        print("🔧 TTF → OTF — FRINGE ELIMINATION SPECIALIST v6.0")
         print("=" * 60)
         print(f"Input:       {args.input_path}")
         print(f"Output:      {args.output_dir}")
@@ -1113,6 +1240,8 @@ EXAMPLES:
         width=args.width,
         quantise_curve=args.quantise_curve,
         blue_quantise=args.blue_quantise,
+        scale=args.scale,
+        spacing=args.spacing,
     )
 
     sys.exit(0 if success > 0 else 1)
