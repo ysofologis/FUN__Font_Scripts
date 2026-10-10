@@ -380,6 +380,68 @@ Both new flags default to 0 (no-op) so v5 invocations keep behaving identically.
 
 The `1 skipped (zero-width preserved)` is a combining mark whose width stayed at 0 — exactly the behaviour documented in the help text, and exactly the bug class this guard was added for.
 
+### flatten_straight_curves.py — post-pass for `--thickness`
+
+`ttf2otf_ff_v5.py --thickness` calls FontForge `changeWeight()`, which
+rewrites every segment it touches. A straight diagonal — the long edge of a
+Z, N, A, V, X, W — comes back as a cubic whose control points sit a couple
+of units off the chord. The stroke keeps its nominal weight, but the outline
+no longer matches the source: in the designer's original, a shape either
+needs a curve or it gets a line.
+
+| NeverMindCompact (upm=2048) | near-straight curves |
+|---|---|
+| source | **1** of 935 |
+| after `--thickness 2` | **4791** of 10268 |
+
+Run it **after** v5, under an interpreter that has fontTools:
+
+```bash
+fontforge -script ttf2otf_ff_v5.py --scale 1.2 --thickness 2 --width 5 \
+  ./src/ ./out/
+python3 flatten_straight_curves.py ./out/Face.otf --in-place
+# or: python3 flatten_straight_curves.py ./out/Face.otf -o ./final/Face.otf
+```
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--rel-tol F` | `0.02` | Straighten when bow <= F x the segment's own length |
+| `--max-bow U` | `0.2%` of em | Absolute bow cap in font units; `-1` disables |
+| `--dry-run` | — | Report what would change, write nothing |
+
+Both tests must agree to **keep** a curve; either one straightens it. The
+absolute cap catches artifacts on medium segments (a 3.6u bow on a 643u
+segment is 0.0057 of its length but only 0.018% of the em). The ratio test
+catches artifacts on long segments and is what protects genuinely curved
+joins. Measured on NeverMindCompact the artifacts sit at 0.005–0.013 of
+segment length while real joins — an N's shoulder (123u over 1107u), a
+Thin's near-semicircular terminal (43u over 50u) — sit at 0.09–0.86, so any
+setting in that wide gap is safe.
+
+Verified on NeverMindCompact Regular, all 20 faces through v5 + this pass:
+
+| glyph | before | after |
+|-------|--------|-------|
+| Z, N, A, V, W, Y | 2, 3, 4, 5, 11, 4 curves | **0 — straight lines** |
+| X, M, K | 8, 4, 4 curves | 2, 1, 1 — real curves (81.97u, 84.20u, 93.84u) kept |
+| `o`, `B`, `P`, `G` | 9, 8, 5, 11 curves | **unchanged** |
+| `S`, `O`, `C` | 15, 13, 13 | sub-unit artifacts only; max bow unchanged |
+| advance widths | — | changed on **0 of 1103** glyphs |
+
+**Why this is a separate script.** The FontForge Python layer cannot express
+the edit: on FontForge 20251009, `contour[i].x = v` reads back correctly from
+the same reference but reverts on a fresh read, `point.transform()` reports
+success without persisting, and `point.remove_point` / `layer.addContour` do
+not exist. A fix inside v5 would report work it cannot perform. Note also
+that `fontforge -script` has no fontTools, so v5's own `phase_postprocess`
+(GASP, head flags, pixel snap) is **dead code under that launcher** — running
+v5 under plain `python3.14` activates it and changes roughly 89% of the
+output bytes.
+
+**Cosmetic impact: none.** The worst diagonal bow is 3.18u at upm 2048 —
+0.155% of em, about 0.02px at 14px. Before and after render identically.
+This is a correctness fix, not a rendering fix.
+
 ### Verified limits & behaviour
 
 - **Stem is measured from outlines**, never guessed. Jano Sans Pro Regular: 88u
