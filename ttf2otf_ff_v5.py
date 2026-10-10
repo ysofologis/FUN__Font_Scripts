@@ -481,7 +481,7 @@ class FringeKiller:
     def __init__(self, aggression='medium', thickness=0, compact=False,
                  hint=True, gasp=True, hint_tune=True, verbose=True,
                  width=0, quantise_curve=50, blue_quantise=1,
-                 scale=0, spacing=0):
+                 scale=0, spacing=0, fonttools_mode='auto'):
         self.aggression = aggression
         self.thickness = thickness
         self.compact = compact
@@ -501,6 +501,10 @@ class FringeKiller:
         self.quantise_curve = quantise_curve
         # v5 NEW: BlueValues round-to-grid (1 unit = maximum precision)
         self.blue_quantise = blue_quantise
+        # v6 NEW: --fonttools-mode. 'auto' keeps the historical behaviour
+        # (Phase 9 runs when fontTools happens to be importable), 'on' forces
+        # it, 'off' never runs it. See phase_postprocess.
+        self.fonttools_mode = fonttools_mode
         # Make private attributes accessible by phase methods
         self._quantise_curve = quantise_curve
         self._blue_quantise = blue_quantise
@@ -1119,9 +1123,54 @@ class FringeKiller:
 
     # -- Phase 9: fontTools post-processing --
     def phase_postprocess(self, font_path):
-        """Use fontTools for GASP, head flags, CFF hint tuning, and pixel snapping."""
-        if not FONTTOOLS_AVAILABLE:
+        """Use fontTools for GASP, head flags, CFF hint tuning, and pixel snapping.
+
+        Phase 9 is the one phase whose availability depends on the LAUNCHER,
+        not on a flag. `fontforge -script` embeds its own interpreter, which
+        does not carry fontTools even where it is installed system-wide, so
+        FONTTOOLS_AVAILABLE is False there and this phase is skipped -- while
+        the very same command run under /usr/bin/python3.14 runs it and
+        rewrites GASP, head flags, BlueValues and every glyf coordinate.
+        Measured on NeverMindCompact-Regular, that is roughly 89% of output
+        bytes differing between the two launchers for identical arguments.
+
+        Default stays 'auto' -- the current behaviour -- so nobody's pipeline
+        changes underneath them. What was wrong was the silence: the skip was
+        invisible, so the same command produced materially different fonts
+        depending on how it was invoked. It is now always reported, and
+        --fonttools-mode makes the choice explicit.
+        """
+        mode = self.fonttools_mode
+        if mode not in ('auto', 'on', 'off'):
+            self._log(f"WARNING ignoring --fonttools-mode {mode!r} "
+                      "(expected auto, on or off)")
+            mode = 'auto'
+
+        if mode == 'off':
+            self._log("Phase 9 SKIPPED: --fonttools-mode off", 'phase')
             return
+
+        if not FONTTOOLS_AVAILABLE:
+            if mode == 'on':
+                # An explicit requirement that cannot be met has to fail the
+                # font. Logging ERROR and then returning success is exactly
+                # the failure mode item 4 just removed from
+                # otf_optimize-ff-v2.0.py, so it is not repeated here.
+                # run() turns this into a False verdict and a reported
+                # failure; the generated file is left in place for triage.
+                raise RuntimeError(
+                    "--fonttools-mode on requires fontTools, which is not "
+                    f"importable under {sys.executable}. Re-run under "
+                    "/usr/bin/python3.14, or use --fonttools-mode auto.")
+            else:
+                self._log("Phase 9 SKIPPED: fontTools is not importable "
+                          f"under {sys.executable}, so GASP / head flags / "
+                          "BlueValues / glyf pixel snap were NOT applied. "
+                          "The same command under /usr/bin/python3.14 does "
+                          "apply them. Use --fonttools-mode on to require "
+                          "them, or off to skip deliberately.", 'phase')
+            return
+
         self._log("Phase 9: fontTools post-processing (GASP, head flags, pixel snap)", 'phase')
 
         try:
@@ -1392,7 +1441,7 @@ def _run_single_in_subprocess(font_path, out_path, opts, timeout):
 def walk_and_convert(input_path, out_dir, aggression='medium', thickness=0,
                      compact=False, hint=True, gasp=True, hint_tune=True,
                      verbose=True, width=0, quantise_curve=50, blue_quantise=1,
-                     scale=0, spacing=0, timeout=0):
+                     scale=0, spacing=0, timeout=0, fonttools_mode='auto'):
     """Walk input path (file or directory) and convert all TTFs."""
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1400,7 +1449,8 @@ def walk_and_convert(input_path, out_dir, aggression='medium', thickness=0,
         aggression=aggression, thickness=thickness, compact=compact,
         hint=hint, gasp=gasp, hint_tune=hint_tune, verbose=verbose,
         width=width, quantise_curve=quantise_curve,
-        blue_quantise=blue_quantise, scale=scale, spacing=spacing)
+        blue_quantise=blue_quantise, scale=scale, spacing=spacing,
+        fonttools_mode=fonttools_mode)
 
     if os.path.isfile(input_path):
         base = os.path.splitext(os.path.basename(input_path))[0]
@@ -1574,6 +1624,18 @@ EXAMPLES:
                         help="CFF hint tuning (synthesise BlueValues if missing)")
     parser.add_argument("--no-hint-tune", dest="hint_tune", action="store_false",
                         help="Skip CFF hint tuning")
+    parser.add_argument("--fonttools-mode", choices=("auto", "on", "off"),
+                        default="auto",
+                        help="Phase 9 (fontTools GASP/head/BlueValues/glyf "
+                             "pixel snap). 'auto' (default) runs it when "
+                             "fontTools is importable and says so when it is "
+                             "not; 'on' requires it and errors if "
+                             "unavailable; 'off' never runs it. Note that "
+                             "'fontforge -script' and /usr/bin/python3.14 "
+                             "differ here: the former has no fontTools, so "
+                             "auto skips Phase 9 while the latter runs it, "
+                             "changing ~89%% of output bytes for identical "
+                             "arguments.")
     parser.add_argument("-v", "--verbose", action="store_true", default=True,
                         help="Verbose output (default: on)")
     parser.add_argument("-q", "--quiet", dest="verbose", action="store_false",
@@ -1601,7 +1663,8 @@ EXAMPLES:
                               args.verbose, width=args.width,
                               quantise_curve=args.quantise_curve,
                               blue_quantise=args.blue_quantise,
-                              scale=args.scale, spacing=args.spacing)
+                              scale=args.scale, spacing=args.spacing,
+                              fonttools_mode=args.fonttools_mode)
         sys.exit(0 if killer.run(in_path, out_path) else 1)
 
     if not args.input_path or not args.output_dir:
@@ -1651,6 +1714,7 @@ EXAMPLES:
         scale=args.scale,
         spacing=args.spacing,
         timeout=args.timeout,
+        fonttools_mode=args.fonttools_mode,
     )
 
     sys.exit(0 if success > 0 else 1)
