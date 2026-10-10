@@ -353,7 +353,15 @@ names the interpreter to use.
 
 ### ttf2otf_ff_v6.0 — `--scale` and `--spacing`
 
-`ttf2otf_ff_v6.py` is the v5 script renamed in place, with two new flags:
+**There is no `ttf2otf_ff_v6.py`.** v6.0 is a version label inside
+`ttf2otf_ff_v5.py`: the script was extended in place and its `--version`
+string and banner read `ttf2otf_ff_v6.0`. Run it as:
+
+```bash
+fontforge -script ttf2otf_ff_v5.py [flags] IN_DIR OUT_DIR
+```
+
+So `ttf2otf_ff_v5.py` is the file and `v6.0` is its version. Two new flags:
 
 | Flag | Effect | Notes |
 |------|--------|-------|
