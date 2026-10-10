@@ -55,6 +55,7 @@ import argparse
 import math
 import shutil
 import tempfile
+import subprocess
 from pathlib import Path
 
 try:
@@ -71,6 +72,303 @@ try:
     FONTTOOLS_AVAILABLE = True
 except ImportError:
     FONTTOOLS_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------
+# Flatten pass fontTools bootstrap
+#
+# Under `fontforge -script` the embedded interpreter does not carry
+# fontTools even when it is installed system-wide, and it is absent from
+# sys.path. FONTTOOLS_AVAILABLE above is deliberately left False in that
+# case: Phase 9 rewrites GASP, head flags, BlueValues and every glyf
+# coordinate, which changes roughly 89% of the output bytes, and switching
+# that on implicitly would be a silent behaviour change for anyone
+# already using this launcher. The flatten pass below opts in on its own,
+# so only the geometry fix turns on.
+# --------------------------------------------------------------------------
+def _import_fonttools():
+    try:
+        import fontTools  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _bootstrap_flatten_fonttools():
+    """Make fontTools importable without touching FONTTOOLS_AVAILABLE."""
+    if _import_fonttools():
+        return True
+    for exe in ('/usr/bin/python3.14', '/usr/bin/python3', sys.executable):
+        if not exe or not os.path.exists(exe):
+            continue
+        try:
+            proc = subprocess.run(
+                [exe, '-c',
+                 'import fontTools,os;'
+                 'print(os.path.dirname(os.path.dirname('
+                 'fontTools.__file__)))'],
+                capture_output=True, text=True, timeout=20)
+        except Exception:
+            continue
+        path = (proc.stdout or '').strip()
+        if proc.returncode == 0 and path and os.path.isdir(path) \
+                and path not in sys.path:
+            sys.path.append(path)
+            if _import_fonttools():
+                return True
+    return False
+
+
+FLATTEN_TOOLS = _bootstrap_flatten_fonttools()
+
+
+# --------------------------------------------------------------------------
+# Phase 4b: straighten near-straight curves
+#
+# changeWeight() rewrites every segment it touches, so a straight diagonal
+# -- the long edge of a Z, N, A, V, W, X -- comes back as a cubic whose
+# controls sit a couple of units off the chord. Measured on NeverMindCompact
+# (upm 2048): the source has 1 near-straight curve of 935; after
+# --thickness 5 it has 4791 of 10268, and Z's two diagonals bow 155.34u and
+# 158.84u, maximal at t=0.50. That is 7.8% of the em -- about 15px of
+# curvature at 200ppem, which is what "swollen diagonal" looks like. At
+# --thickness 2 the same segment bows only 3.18u, so the severity tracks
+# the thickness requested.
+#
+# This runs on the generated file with fontTools because the FontForge
+# Python layer cannot express the edit at all: on 20251009, contour[i].x
+# reads back correctly from the same reference but reverts on a fresh read,
+# point.transform() reports success without persisting, and
+# point.remove_point / layer.addContour do not exist. A fix written there
+# reports work it cannot perform -- it claimed 558 curves flattened while
+# the output changed by 6 bytes.
+#
+# No threshold is used. The input TTF is the source, so a segment is
+# straightened only where the source glyph had a straight or near-flat
+# segment in the same place. That distinction cannot be made locally: at
+# --thickness 5 the artifact sits at 0.114 of segment length while the
+# bowls of o/e/G sit at 0.14-0.36, the same range, so neither
+# bow-over-length nor bow-over-stroke-width separates them.
+# --------------------------------------------------------------------------
+def _fl_bow(p0, c1, c2, p3, steps=16):
+    """Max perpendicular deviation of a cubic from the chord p0 -> p3."""
+    dx = p3[0] - p0[0]
+    dy = p3[1] - p0[1]
+    length = math.hypot(dx, dy)
+    if length == 0:
+        return 0.0, 0.0
+    worst = 0.0
+    for k in range(steps + 1):
+        t = k / float(steps)
+        mt = 1.0 - t
+        x = (mt * mt * mt * p0[0] + 3 * mt * mt * t * c1[0]
+             + 3 * mt * t * t * c2[0] + t * t * t * p3[0])
+        y = (mt * mt * mt * p0[1] + 3 * mt * mt * t * c1[1]
+             + 3 * mt * t * t * c2[1] + t * t * t * p3[1])
+        d = abs((x - p0[0]) * dy - (y - p0[1]) * dx) / length
+        if d > worst:
+            worst = d
+    return worst, length
+
+
+def _fl_quad_to_cubic(p0, q, p2):
+    """Exact degree elevation of a quadratic to a cubic."""
+    c1 = (p0[0] + 2.0 / 3.0 * (q[0] - p0[0]),
+          p0[1] + 2.0 / 3.0 * (q[1] - p0[1]))
+    c2 = (p2[0] + 2.0 / 3.0 * (q[0] - p2[0]),
+          p2[1] + 2.0 / 3.0 * (q[1] - p2[1]))
+    return c1, c2
+
+
+def _fl_segments(ops):
+    """Split a pen recording into ('line'|'cubic', start, ..., end)."""
+    out = []
+    cur = None
+    for op, args in ops:
+        if op == 'moveTo':
+            cur = args[0]
+        elif op == 'lineTo':
+            if cur is not None:
+                out.append(('line', cur, args[0]))
+            cur = args[0]
+        elif op == 'curveTo':
+            if cur is not None:
+                out.append(('cubic', cur, args[0], args[1], args[2]))
+            cur = args[2]
+        elif op == 'qCurveTo':
+            pts = list(args)
+            end = cur if pts and pts[-1] is None else pts[-1]
+            offs = [p for p in pts if p is not None]
+            if cur is not None and end is not None:
+                for i, q in enumerate(offs):
+                    nxt = end if i == len(offs) - 1 else \
+                        ((q[0] + offs[i + 1][0]) / 2.0,
+                         (q[1] + offs[i + 1][1]) / 2.0)
+                    c1, c2 = _fl_quad_to_cubic(cur, q, nxt)
+                    out.append(('cubic', cur, c1, c2, nxt))
+                    cur = nxt
+            cur = end
+    return out
+
+
+class _FlattenPen:
+    """Filter pen: emit lineTo where the source had a straight segment."""
+
+    def __init__(self, outPen, src_mids, src_tol, stats):
+        self.outPen = outPen
+        self.src_mids = src_mids
+        self.src_tol = src_tol
+        self.stats = stats
+        self._pt = None
+
+    def _source_was_straight(self, p3):
+        if not self.src_mids:
+            return False
+        mid = ((self._pt[0] + p3[0]) / 2.0, (self._pt[1] + p3[1]) / 2.0)
+        best, bestd = None, None
+        for smid, seg in self.src_mids:
+            d = (smid[0] - mid[0]) ** 2 + (smid[1] - mid[1]) ** 2
+            if bestd is None or d < bestd:
+                bestd, best = d, seg
+        if best is None or best[0] == 'line':
+            return True
+        b, L = _fl_bow(best[1], best[2], best[3], best[4])
+        return L > 0 and b <= self.src_tol
+
+    def moveTo(self, pt):
+        self._pt = pt
+        self.outPen.moveTo(pt)
+
+    def lineTo(self, pt):
+        self._pt = pt
+        self.outPen.lineTo(pt)
+
+    def curveTo(self, *points):
+        for i in range(0, len(points) - 2, 3):
+            c1, c2, p3 = points[i], points[i + 1], points[i + 2]
+            if self._pt is not None and self._source_was_straight(p3):
+                self.outPen.lineTo(p3)
+                self.stats['flattened'] += 1
+            else:
+                self.outPen.curveTo(c1, c2, p3)
+                self.stats['kept'] += 1
+            self._pt = p3
+
+    def qCurveTo(self, *points):
+        pts = list(points)
+        end = self._pt if pts and pts[-1] is None else pts[-1]
+        offs = [p for p in pts if p is not None]
+        if end is None:
+            return
+        cur = self._pt
+        for i, q in enumerate(offs):
+            nxt = end if i == len(offs) - 1 else \
+                ((q[0] + offs[i + 1][0]) / 2.0, (q[1] + offs[i + 1][1]) / 2.0)
+            if cur is None:
+                self.moveTo(q)
+                cur = q
+                continue
+            c1, c2 = _fl_quad_to_cubic(cur, q, nxt)
+            self.curveTo(c1, c2, nxt)
+            cur = nxt
+
+    def closePath(self):
+        self.outPen.closePath()
+        self._pt = None
+
+    def endPath(self):
+        self.outPen.endPath()
+        self._pt = None
+
+    def addComponent(self, name, transformation):
+        self.outPen.addComponent(name, transformation)
+        self._pt = None
+
+
+def flatten_straight_curves(out_path, src_path):
+    """Straighten curves that were straight in src_path. Returns (n, kept)."""
+    if not FLATTEN_TOOLS:
+        return None
+    from fontTools.pens.recordingPen import RecordingPen
+    from fontTools.ttLib import TTFont as _FT
+
+    try:
+        font = _FT(out_path)
+        src = _FT(src_path)
+    except Exception:
+        return None
+
+    try:
+        from fontTools.pens.t2CharStringPen import T2CharStringPen
+        from fontTools.pens.ttGlyphPen import TTGlyphPen
+    except ImportError:
+        return None
+
+    is_cff = ('CFF ' in font) or ('CFF2' in font)
+    key = 'CFF ' if 'CFF ' in font else ('CFF2' if 'CFF2' in font else None)
+    if not is_cff and 'glyf' not in font:
+        return None
+
+    upem = font['head'].unitsPerEm if 'head' in font else 1000
+    src_tol = upem * 0.002
+
+    glyph_set = font.getGlyphSet()
+    src_set = src.getGlyphSet()
+    total = {'flattened': 0, 'kept': 0}
+
+    if is_cff:
+        top = font[key].cff.topDictIndex[0]
+        char_strings = top.CharStrings
+        private = getattr(top, 'Private', None)
+        global_subrs = getattr(top, 'GlobalSubrs', None)
+
+    for name in font.getGlyphOrder():
+        rec = RecordingPen()
+        try:
+            glyph_set[name].draw(rec)
+        except Exception:
+            continue
+        if not rec.value:
+            continue
+        srec = RecordingPen()
+        try:
+            src_set[name].draw(srec)
+        except Exception:
+            continue
+        src_mids = [(((s[1][0] + s[-1][0]) / 2.0,
+                      (s[1][1] + s[-1][1]) / 2.0), s)
+                    for s in _fl_segments(srec.value)]
+        stats = {'flattened': 0, 'kept': 0}
+        try:
+            if is_cff:
+                width = font['hmtx'][name][0] if 'hmtx' in font else None
+                pen = T2CharStringPen(width, glyph_set, roundTolerance=0)
+                sp = _FlattenPen(pen, src_mids, src_tol, stats)
+                for op, args in rec.value:
+                    getattr(sp, op)(*args)
+                char_strings[name].program = pen.getCharString(
+                    private=private, globalSubrs=global_subrs).program
+            else:
+                pen = TTGlyphPen(None)
+                sp = _FlattenPen(pen, src_mids, src_tol, stats)
+                for op, args in rec.value:
+                    getattr(sp, op)(*args)
+                font['glyf'][name] = pen.glyph()
+        except Exception:
+            continue
+        total['flattened'] += stats['flattened']
+        total['kept'] += stats['kept']
+
+    try:
+        font.save(out_path)
+    except Exception:
+        return None
+    finally:
+        try:
+            src.close()
+        except Exception:
+            pass
+    return (total['flattened'], total['kept'])
 
 
 # Smallest hole (in font units) that Phase 5's counter shrink is allowed to
@@ -958,6 +1256,36 @@ class FringeKiller:
 
         self.stats['hint_tune_applied'] = True
 
+    def phase_flatten(self, in_path, out_path):
+        """Phase 8b: collapse near-straight curves back onto their chords.
+
+        Only runs when --thickness was used, since changeWeight is what
+        creates them, and only when the source font is still readable. The
+        input TTF is the source, so no threshold is needed to tell an
+        artifact from a designed curve.
+        """
+        if self.thickness <= 0:
+            return
+        if not FLATTEN_TOOLS:
+            if self.verbose:
+                self._log("Phase 8b: flatten skipped (fontTools unavailable)",
+                          'sub')
+            return
+        try:
+            result = flatten_straight_curves(out_path, in_path)
+        except Exception as e:
+            self._log(f"Phase 8b issue: {e}", 'sub')
+            return
+        if result is None:
+            self._log("Phase 8b: flatten skipped (glyphs unreadable)", 'sub')
+            return
+        flattened, kept = result
+        self.stats['curves_flattened'] = flattened
+        self.stats['curves_kept'] = kept
+        if flattened:
+            self._log(f"Phase 8b: straightened {flattened} near-straight "
+                      f"curves back onto their chords ({kept} kept)", 'sub')
+
     # -- Validation --
     def validate(self, in_path, out_path):
         """Verify output font is loadable and has reasonable structure."""
@@ -1003,6 +1331,8 @@ class FringeKiller:
             # Phase 8 (generate)
             os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
             self.phase_generate(font, out_path)
+            # Phase 8b: straighten curves changeWeight created
+            self.phase_flatten(in_path, out_path)
             # Phase 9 (fontTools post-processing)
             self.phase_postprocess(out_path)
             # Validate
@@ -1026,23 +1356,65 @@ class FringeKiller:
 #  Walk input path and process each TTF
 # ---------------------------------------------------------------------------
 
+def _run_single_in_subprocess(font_path, out_path, opts, timeout):
+    """Convert one font in a child `fontforge -script` and enforce a timeout.
+
+    Phase 4's changeWeight can drive FontForge into a C-level spin on some
+    faces -- NeverMindCompact-Thin at --thickness 5 produces 23 "Unexpected
+    point count in SSAddPoints", freezes its log, and keeps burning CPU
+    while emitting no output. No in-process guard can stop that: the hang is
+    inside FontForge's C code, so a Python signal handler or thread never
+    runs again. Isolation is the only way to convert a stalled face into a
+    reported failure so the rest of the batch still completes.
+
+    Returns (ok, timed_out) so a genuine timeout is not misreported as a
+    crash -- they need different remedies, and conflating them hides which
+    one happened.
+    """
+    cmd = [sys.executable, '-script', __file__, '--single-font',
+           font_path, out_path]
+    for key, value in opts.items():
+        flag = '--' + key.replace('_', '-')
+        if value is True:
+            cmd.append(flag)
+        elif value not in (False, None, 0, 0.0, ''):
+            cmd.extend([flag, str(value)])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, True
+    except Exception:
+        return False, False
+    return (proc.returncode == 0 and os.path.exists(out_path)), False
+
+
 def walk_and_convert(input_path, out_dir, aggression='medium', thickness=0,
                      compact=False, hint=True, gasp=True, hint_tune=True,
                      verbose=True, width=0, quantise_curve=50, blue_quantise=1,
-                     scale=0, spacing=0):
+                     scale=0, spacing=0, timeout=0):
     """Walk input path (file or directory) and convert all TTFs."""
     os.makedirs(out_dir, exist_ok=True)
+
+    opts = dict(
+        aggression=aggression, thickness=thickness, compact=compact,
+        hint=hint, gasp=gasp, hint_tune=hint_tune, verbose=verbose,
+        width=width, quantise_curve=quantise_curve,
+        blue_quantise=blue_quantise, scale=scale, spacing=spacing)
 
     if os.path.isfile(input_path):
         base = os.path.splitext(os.path.basename(input_path))[0]
         out_path = os.path.join(out_dir, f"{base}.otf")
-        killer = FringeKiller(aggression, thickness, compact, hint, gasp,
-                              hint_tune, verbose, width=width,
-                              quantise_curve=quantise_curve,
-                              blue_quantise=blue_quantise,
-                              scale=scale, spacing=spacing)
-        ok = killer.run(input_path, out_path)
-        _print_stats(killer, [os.path.basename(input_path)], ok)
+        if timeout and timeout > 0:
+            ok, timed_out = _run_single_in_subprocess(
+                input_path, out_path, opts, timeout)
+        else:
+            killer = FringeKiller(**opts)
+            ok = killer.run(input_path, out_path)
+            _print_stats(killer, [os.path.basename(input_path)], ok)
+        if not ok:
+            why = 'timed out' if timed_out else 'failed'
+            print(f"❌ {base}: conversion {why}", file=sys.stderr)
         return 1 if ok else 0
 
     # Walk for all .ttf files
@@ -1067,12 +1439,23 @@ def walk_and_convert(input_path, out_dir, aggression='medium', thickness=0,
         target_dir = out_dir if rel == '.' else os.path.join(out_dir, rel)
         base = os.path.splitext(os.path.basename(font_path))[0]
         out_path = os.path.join(target_dir, f"{base}.otf")
+        os.makedirs(target_dir, exist_ok=True)
 
-        killer = FringeKiller(aggression, thickness, compact, hint, gasp,
-                              hint_tune, verbose, width=width,
-                              quantise_curve=quantise_curve,
-                              blue_quantise=blue_quantise,
-                              scale=scale, spacing=spacing)
+        if timeout and timeout > 0:
+            ok, timed_out = _run_single_in_subprocess(
+                font_path, out_path, opts, timeout)
+            if not ok:
+                failures.append(os.path.basename(font_path))
+                if verbose:
+                    why = f"timed out after {timeout}s" if timed_out \
+                        else "conversion failed"
+                    print(f"❌ {base}: {why} (skipped, batch continues)",
+                          file=sys.stderr)
+            else:
+                success += 1
+            continue
+
+        killer = FringeKiller(**opts)
         ok = killer.run(font_path, out_path)
         if ok:
             success += 1
@@ -1141,9 +1524,9 @@ EXAMPLES:
         """
     )
 
-    parser.add_argument("input_path",
+    parser.add_argument("input_path", nargs="?",
                         help="Path to a directory of .ttf files or a single .ttf")
-    parser.add_argument("output_dir",
+    parser.add_argument("output_dir", nargs="?",
                         help="Directory where optimised .otf files will be saved")
 
     parser.add_argument("-a", "--aggression",
@@ -1196,8 +1579,33 @@ EXAMPLES:
     parser.add_argument("-q", "--quiet", dest="verbose", action="store_false",
                         help="Quiet mode (errors only)")
     parser.add_argument("--version", action="version", version="ttf2otf_ff_v6.0")
+    parser.add_argument("--timeout", type=int, default=0,
+                        help="Per-font timeout in seconds (0 = no limit). "
+                             "Each font converts in a child process, so one "
+                             "that hangs inside FontForge -- e.g. "
+                             "NeverMindCompact-Thin at --thickness 5, which "
+                             "spins in C and never returns -- is reported as "
+                             "a failure and the batch continues. Default: 0.")
+    parser.add_argument("--single-font", nargs=2, metavar=("IN", "OUT"),
+                        help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    # --single-font is how the parent re-enters this script once per font
+    # under --timeout. It carries its own paths, so it must be handled
+    # before the positional arguments are validated.
+    if args.single_font:
+        in_path, out_path = args.single_font
+        killer = FringeKiller(args.aggression, args.thickness, args.compact,
+                              args.hint, args.gasp, args.hint_tune,
+                              args.verbose, width=args.width,
+                              quantise_curve=args.quantise_curve,
+                              blue_quantise=args.blue_quantise,
+                              scale=args.scale, spacing=args.spacing)
+        sys.exit(0 if killer.run(in_path, out_path) else 1)
+
+    if not args.input_path or not args.output_dir:
+        parser.error("input_path and output_dir are required")
 
     if not os.path.exists(args.input_path):
         print(f"❌ Input path does not exist: {args.input_path}", file=sys.stderr)
@@ -1242,6 +1650,7 @@ EXAMPLES:
         blue_quantise=args.blue_quantise,
         scale=args.scale,
         spacing=args.spacing,
+        timeout=args.timeout,
     )
 
     sys.exit(0 if success > 0 else 1)
