@@ -130,12 +130,38 @@ class StraightenPen:
     point. addComponent is forwarded so composites survive intact.
     """
 
-    def __init__(self, outPen, rel_tol=0.02, max_bow=None, stats=None):
+    def __init__(self, outPen, rel_tol=0.02, max_bow=None, stats=None,
+                 src_segs=None, source_tol=None):
         self.outPen = outPen
         self.rel_tol = rel_tol
         self.max_bow = max_bow
         self.stats = stats if stats is not None else {"flattened": 0, "kept": 0}
         self._pt = None
+        # When the source geometry is known, only segments that were
+        # straight in the source are straightened -- see flatten_font().
+        self._src_segs = src_segs
+        self._src_mids = None
+        self._src_tol = source_tol
+        if src_segs:
+            self._src_mids = [(_seg_mid(s), s) for s in src_segs]
+
+    def _was_straight_in_source(self, p3):
+        """True if the nearest source segment was a line or near-flat."""
+        if not self._src_mids:
+            return None
+        mid = ((self._pt[0] + p3[0]) / 2.0, (self._pt[1] + p3[1]) / 2.0)
+        best = None
+        bestd = None
+        for smid, seg in self._src_mids:
+            d = (smid[0] - mid[0]) ** 2 + (smid[1] - mid[1]) ** 2
+            if bestd is None or d < bestd:
+                bestd, best = d, seg
+        if best is None or best[0] == "line":
+            return True
+        b, L = _seg_bow(best)
+        if L == 0:
+            return True
+        return b <= self._src_tol
 
     # -- straightness test --
     def _is_straight(self, p0, c1, c2, p3):
@@ -164,7 +190,10 @@ class StraightenPen:
 
     def _emit_cubic(self, c1, c2, p3):
         p0 = self._pt
-        if p0 is not None and self._is_straight(p0, c1, c2, p3):
+        straight = self._was_straight_in_source(p3)
+        if straight is None:
+            straight = self._is_straight(p0, c1, c2, p3)
+        if p0 is not None and straight:
             self.outPen.lineTo(p3)
             self.stats["flattened"] += 1
         else:
@@ -226,22 +255,80 @@ class StraightenPen:
         pass
 
 
-def flatten_font(font, rel_tol=0.02, max_bow=None, dry_run=False, verbose=True):
-    """Straighten near-straight curves in every glyph. Returns stats."""
+def _segments(ops):
+    """Split a pen recording into (kind, start, *controls) segments."""
+    out = []
+    cur = None
+    for op, args in ops:
+        if op == "moveTo":
+            cur = args[0]
+        elif op == "lineTo":
+            if cur is not None:
+                out.append(("line", cur, args[0]))
+            cur = args[0]
+        elif op == "curveTo":
+            if cur is not None:
+                out.append(("cubic", cur, args[0], args[1], args[2]))
+            cur = args[2]
+        elif op == "qCurveTo":
+            pts = list(args)
+            end = cur if pts and pts[-1] is None else pts[-1]
+            offs = [p for p in pts if p is not None]
+            if cur is not None and end is not None:
+                for i, q in enumerate(offs):
+                    nxt = end if i == len(offs) - 1 else \
+                        ((q[0] + offs[i + 1][0]) / 2.0,
+                         (q[1] + offs[i + 1][1]) / 2.0)
+                    c1, c2 = _quad_to_cubic(cur, q, nxt)
+                    out.append(("cubic", cur, c1, c2, nxt))
+                    cur = nxt
+            cur = end
+    return out
+
+
+def _seg_mid(s):
+    p0 = s[1]
+    p3 = s[-1]
+    return ((p0[0] + p3[0]) / 2.0, (p0[1] + p3[1]) / 2.0)
+
+
+def _seg_bow(s):
+    if s[0] == "line":
+        return 0.0, 0.0
+    p0, c1, c2, p3 = s[1], s[2], s[3], s[4]
+    return _bow(p0, c1, c2, p3)
+
+
+def flatten_font(font, rel_tol=0.02, max_bow=None, dry_run=False, verbose=True,
+                 source=None, source_tol=None):
+    """Straighten near-straight curves in every glyph. Returns stats.
+
+    With source=..., only segments that were STRAIGHT in the source are
+    straightened. This is the only reliable way to tell an emboldening
+    artifact from a designed curve: the source Z is 13 lines, so a curve
+    on it afterwards is changeWeight's doing, while the bowls of o/e/G are
+    real in the source and are left alone. No local threshold can make
+    that distinction -- measured bow/length for the Z artifact is 0.114
+    and for genuine bowls 0.14-0.36, the same range.
+    """
     glyph_order = font.getGlyphOrder()
     glyph_set = font.getGlyphSet()
     upem = font["head"].unitsPerEm if "head" in font else 1000
     if max_bow is None:
         max_bow = upem * 0.002
+    if source_tol is None:
+        source_tol = upem * 0.002
     total = {"flattened": 0, "kept": 0}
+
+    src_set = source.getGlyphSet() if source is not None else None
 
     is_cff = ("CFF " in font) or ("CFF2" in font)
 
     if is_cff:
         if not _HAVE_T2:
             raise RuntimeError("fontTools T2CharStringPen unavailable")
-        top = font["CFF "].cff.topDictIndex[0] if "CFF " in font \
-            else font["CFF2"].cff.topDictIndex[0]
+        key = "CFF " if "CFF " in font else "CFF2"
+        top = font[key].cff.topDictIndex[0]
         char_strings = top.CharStrings
         private = getattr(top, "Private", None)
         global_subrs = getattr(top, "GlobalSubrs", None)
@@ -256,12 +343,22 @@ def flatten_font(font, rel_tol=0.02, max_bow=None, dry_run=False, verbose=True):
         if not rec.value:
             continue
 
+        src_segs = None
+        if src_set is not None:
+            try:
+                srec = RecordingPen()
+                src_set[name].draw(srec)
+                src_segs = _segments(srec.value)
+            except Exception:
+                src_segs = None
+
         stats = {"flattened": 0, "kept": 0}
         try:
             if is_cff:
                 width = font["hmtx"][name][0] if "hmtx" in font else None
                 t2 = T2CharStringPen(width, glyph_set, roundTolerance=0)
-                sp = StraightenPen(t2, rel_tol, max_bow, stats)
+                sp = StraightenPen(t2, rel_tol, max_bow, stats,
+                                   src_segs=src_segs, source_tol=source_tol)
                 for op, args in rec.value:
                     getattr(sp, op)(*args)
                 if not dry_run:
@@ -272,7 +369,8 @@ def flatten_font(font, rel_tol=0.02, max_bow=None, dry_run=False, verbose=True):
                 if not _HAVE_TTG:
                     raise RuntimeError("fontTools TTGlyphPen unavailable")
                 tt = TTGlyphPen(None)
-                sp = StraightenPen(tt, rel_tol, max_bow, stats)
+                sp = StraightenPen(tt, rel_tol, max_bow, stats,
+                                   src_segs=src_segs, source_tol=source_tol)
                 for op, args in rec.value:
                     getattr(sp, op)(*args)
                 if not dry_run:
@@ -306,6 +404,12 @@ def main():
                          "the em, -1 disables the cap")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would change, write nothing")
+    ap.add_argument("--source", help="original font the input was derived "
+                    "from; with it, only segments that were straight in the "
+                    "source are straightened (see --source-tol)")
+    ap.add_argument("--source-tol", type=float, default=0.0,
+                    help="a source segment counts as straight when its own "
+                         "bow is <= this many units; 0 uses 0.2%% of the em")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -316,9 +420,15 @@ def main():
         ap.error("--rel-tol must be >= 0")
 
     font = TTFont(args.input)
+    src_font = TTFont(args.source) if args.source else None
     stats = flatten_font(font, rel_tol=args.rel_tol,
                          max_bow=(None if args.max_bow < 0 else args.max_bow),
-                         dry_run=args.dry_run, verbose=not args.quiet)
+                         dry_run=args.dry_run, verbose=not args.quiet,
+                         source=src_font,
+                         source_tol=(None if args.source_tol <= 0
+                                     else args.source_tol))
+    if src_font is not None:
+        src_font.close()
 
     if not args.quiet:
         verb = "would straighten" if args.dry_run else "straightened"

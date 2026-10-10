@@ -407,7 +407,56 @@ python3 flatten_straight_curves.py ./out/Face.otf --in-place
 |------|---------|--------|
 | `--rel-tol F` | `0.02` | Straighten when bow <= F x the segment's own length |
 | `--max-bow U` | `0.2%` of em | Absolute bow cap in font units; `-1` disables |
+| `--source F` | — | Original font; only segments that were **straight in the source** are straightened |
+| `--source-tol U` | `0.2%` of em | A source segment counts as straight when its own bow <= this |
 | `--dry-run` | — | Report what would change, write nothing |
+
+**Use `--source`.** It is the only mode that reliably separates an
+emboldening artifact from a designed curve, and without it this pass can
+miss the defect entirely.
+
+Measured on NeverMindCompact with `--thickness 5`, Z's two diagonals bow
+**155.34u** and **158.84u** over ~1370u segments — ratio **0.114**, both
+maximal at t=0.50. At upm 2048 that is 7.8% of em and clearly visible at
+200px. Plain `--rel-tol 0.02` judges 0.114 "genuinely curved" and **keeps
+both**. Worse, no local threshold can separate the two: the artifact sits
+at 0.114 of segment length while the bowls of `o`/`e`/`G` sit at
+0.14–0.36 — the same range, so bow-over-length and bow-over-stroke-width
+both fail to discriminate.
+
+The source settles it without any threshold: the original Z is **13 lines,
+0 curves**, so a curve on it afterwards is `changeWeight`'s doing, while the
+bowl of an `o` is a real curve in the source and is left alone.
+
+```bash
+fontforge -script ttf2otf_ff_v5.py --scale 2.5 --thickness 5 \
+  --quantise-curve 75 ./src/ ./out/
+python3 flatten_straight_curves.py ./out/Face.otf -o ./final/Face.otf \
+  --source ./src/Face.ttf
+```
+
+| glyph, `--thickness 5` | Z/N/A/V/W/X/M/K/Y worst bow | after |
+|---|---|---|
+| **Z** | **158.84u** | **0.00** |
+| ExtraLight Z | **181.33u** | **0.00** |
+| Light Z / Bold Z | **170.12u / 139.89u** | **0.00** |
+| N, A, V, W, X, M, K, Y | 0.8–3.0u | 0.00 |
+| `S`, `O`, `o`, `a`, `e`, `c`, `C`, `G`, `B`, `P`, `R` | 87–187u (real curves) | **unchanged** |
+| advance widths | — | changed on 0 of 1103 |
+
+`--thickness` sets the severity: at `--thickness 2` the Z bow is 3.18u
+(0.02px at 14px, invisible); at `--thickness 5` it is 158.84u (~15px of
+curvature at 200px, plainly visible). The same command at different
+thickness is a different bug.
+
+The threshold mode is still useful without `--source` when no original is
+available — it catches the sub-unit artifacts `changeWeight` leaves on
+medium and long segments. But it is not a substitute for the source.
+
+**Known unrelated failure:** at `--thickness 5`, v5 dies on
+`NeverMindCompact-Thin` and `NeverMindCompact-ThinItalic` with 23
+`Internal Error: Unexpected point count in SSAddPoints`, leaving no output
+file. This happens inside v5 before this pass runs.
 
 Both tests must agree to **keep** a curve; either one straightens it. The
 absolute cap catches artifacts on medium segments (a 3.6u bow on a 643u
@@ -423,10 +472,14 @@ Verified on NeverMindCompact Regular, all 20 faces through v5 + this pass:
 | glyph | before | after |
 |-------|--------|-------|
 | Z, N, A, V, W, Y | 2, 3, 4, 5, 11, 4 curves | **0 — straight lines** |
-| X, M, K | 8, 4, 4 curves | 2, 1, 1 — real curves (81.97u, 84.20u, 93.84u) kept |
+| X, M, K | 8, 4, 4 curves | **0 — straight lines** (source is a pure polygon; their 81.97u / 84.20u / 93.84u bends are artifacts too) |
 | `o`, `B`, `P`, `G` | 9, 8, 5, 11 curves | **unchanged** |
 | `S`, `O`, `C` | 15, 13, 13 | sub-unit artifacts only; max bow unchanged |
 | advance widths | — | changed on **0 of 1103** glyphs |
+
+Threshold mode (no `--source`) keeps X, M and K's 81–93u bends, because their
+0.11 bow/length ratio reads as a real curve. The source shows they are not —
+so prefer `--source`.
 
 **Why this is a separate script.** The FontForge Python layer cannot express
 the edit: on FontForge 20251009, `contour[i].x = v` reads back correctly from
@@ -438,9 +491,11 @@ that `fontforge -script` has no fontTools, so v5's own `phase_postprocess`
 v5 under plain `python3.14` activates it and changes roughly 89% of the
 output bytes.
 
-**Cosmetic impact: none.** The worst diagonal bow is 3.18u at upm 2048 —
-0.155% of em, about 0.02px at 14px. Before and after render identically.
-This is a correctness fix, not a rendering fix.
+**Cosmetic impact: depends on `--thickness`.** At `--thickness 2` the worst
+diagonal bow is 3.18u — 0.155% of em, about 0.02px at 14px — and before
+and after render identically, so that case is correctness only. At
+`--thickness 5` the same glyph bows 158.84u and the defect is plainly
+visible at 200px.
 
 ### Verified limits & behaviour
 
