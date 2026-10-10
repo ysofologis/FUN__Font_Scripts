@@ -453,10 +453,15 @@ The threshold mode is still useful without `--source` when no original is
 available — it catches the sub-unit artifacts `changeWeight` leaves on
 medium and long segments. But it is not a substitute for the source.
 
-**Known unrelated failure:** at `--thickness 5`, v5 dies on
-`NeverMindCompact-Thin` and `NeverMindCompact-ThinItalic` with 23
-`Internal Error: Unexpected point count in SSAddPoints`, leaving no output
-file. This happens inside v5 before this pass runs.
+**Known unrelated failure:** at `--thickness 5`, v5 hangs indefinitely on
+`NeverMindCompact-Thin` — 23 `Internal Error: Unexpected point count in
+SSAddPoints`, zero output files, log frozen while the process keeps
+burning CPU. `ThinItalic` is fine (it completes on its own); it only went
+missing from a batch run because it sorts after `Thin` and never got the
+time. This happens inside v5, before this pass runs, and **v5 has no
+per-font timeout**, so one bad face stalls the rest of the batch.
+`otf_optimize-ff-v2.0.py` already guards this with `OTF_PER_FONT_TIMEOUT`
+(default 600s); v5 does not.
 
 Both tests must agree to **keep** a curve; either one straightens it. The
 absolute cap catches artifacts on medium segments (a 3.6u bow on a 643u
