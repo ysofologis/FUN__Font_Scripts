@@ -61,10 +61,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -437,17 +439,51 @@ def _transform_glyphs(font, sx: float, sy: float) -> None:
         glyph.transform((sx, 0.0, 0.0, sy, 0.0, 0.0))
 
 
+# FontForge's overlap/spline diagnostics are written by C code straight to
+# file descriptor 2, bypassing Python's logging entirely -- the existing
+# logging.getLogger("fontforge") suppression in main() cannot touch them.
+# Measured on Noto Sans: an 18-face TTF run emitted 182,299 such lines
+# (~10k per font); the identical transform on CFF input emitted 27.
+#
+# Why this matters beyond noise: that flood goes to the terminal. When it
+# outruns the terminal emulator, or when stderr is a pipe whose 64 KB buffer
+# fills, the C writer BLOCKS on backpressure and the run looks hung. The
+# script's own log goes to sys.stdout (see basicConfig in main), so quenching
+# fd 2 hides none of it. --verbose restores the flood for debugging.
+_QUIET_C_STDERR = True
+
+
+@contextmanager
+def _quench_c_stderr():
+    """Point the process's fd 2 at /dev/null for the duration of the block."""
+    if not _QUIET_C_STDERR:
+        yield
+        return
+    saved = os.dup(2)
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, 2)
+        finally:
+            os.close(null)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+
+
 def _cleanup(font) -> int:
     """Per-glyph topology cleanup. Returns glyphs touched."""
     touched = 0
-    for glyph in font.glyphs():
-        try:
-            glyph.removeOverlap()
-            glyph.correctDirection()
-            glyph.round()
-            touched += 1
-        except Exception as exc:
-            log.debug(f"  {glyph.glyphname}: {type(exc).__name__}: {exc}")
+    with _quench_c_stderr():
+        for glyph in font.glyphs():
+            try:
+                glyph.removeOverlap()
+                glyph.correctDirection()
+                glyph.round()
+                touched += 1
+            except Exception as exc:
+                log.debug(f"  {glyph.glyphname}: {type(exc).__name__}: {exc}")
     return touched
 
 
@@ -519,6 +555,65 @@ def _quantize_curve(font, n_units: int) -> int:
     return touched
 
 
+_TYPE2_RANGE_RE = re.compile(
+    r"Number out of range:\s*(-?[\d.eE+]+)\s*in type2 output"
+    r"(?:\s*\(must be \[-?\d+, ?-?\d+\]\))?")
+
+
+def _generate_capturing_c_stderr(font, dst: str) -> list[str]:
+    """Write the font, keeping the C writer's diagnostics instead of /dev/null.
+
+    _quench_c_stderr() deliberately sends fd 2 to /dev/null, which is right
+    for the per-glyph noise but hides a real failure here. On CFF output,
+    changeWeight can drive coordinates far outside the type2 range; the
+    writer reports it and then writes the file anyway.
+
+    Measured on NotoSans-ExtraLight (4503 glyphs, CFF in and CFF out):
+        thickness  2,  5 -> no range errors
+        thickness 10 -> "Number out of range: -6.68943e+13 in type2 output"
+        thickness 20 -> -2.67577e+14
+        thickness 40 -> -5.35154e+14
+    The magnitude scales linearly with thickness, so this is divergence in
+    changeWeight rather than a limit being brushed against. The written
+    file stays readable (max coordinate 2802 against a source 2800) and
+    the intended emboldening does land (H: +10.2% area at thickness 10,
+    +40.7% at 40), so the affected geometry is recovered -- but until now
+    the run returned rc=0 and reported success with the diagnostic thrown
+    away.
+
+    Returns the distinct messages, at most MAX_REPORTED.
+    """
+    max_reported = 3
+    saved = os.dup(2)
+    tmp = tempfile.TemporaryFile(mode="w+b")
+    try:
+        os.dup2(tmp.fileno(), 2)
+        font.generate(dst)
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        tmp.seek(0)
+        try:
+            text = tmp.read().decode("utf-8", "replace")
+        finally:
+            tmp.close()
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        m = _TYPE2_RANGE_RE.search(line)
+        if not m:
+            continue
+        msg = m.group(0).strip()
+        if msg in seen:
+            continue
+        seen.add(msg)
+        found.append(f"{msg} ({m.group(1)})")
+        if len(found) >= max_reported:
+            break
+    return found
+
+
 def apply_transform(src: Path, dst: Path, width_pct: float, height_pct: float,
                   thickness_pct: float, ref_stem: Optional[float],
                   quantize_units: int = 0, spacing_pct: float = 0.0) -> dict:
@@ -541,7 +636,29 @@ def apply_transform(src: Path, dst: Path, width_pct: float, height_pct: float,
                 report["metrics_failed"] = failed
             report["scale_xy"] = (round(sx, 6), round(sy, 6))
 
+        # Topology cleanup, positioned around changeWeight deliberately.
+        #
+        # changeWeight() produces outlines that FontForge 20251009's own
+        # topology ops SIGSEGV on -- a real crash inside libfontforge
+        # (SplineSetsCorrect <- FindEdgesSplineSet), not an exception, so no
+        # try/except can catch it. Measured on the six Noto Sans faces that
+        # died in a real 18-face run, each mode in its own process:
+        #
+        #   cw -> ro -> cd -> round   2/6 survive   (the old order)
+        #   cw -> cd -> round         0/6
+        #   ro -> cw -> cd -> round   0/6
+        #   cw only                   6/6
+        #   ro -> cd -> round -> cw   6/6           (this order)
+        #
+        # So nothing per-glyph may run after thickening. Cleanup happens
+        # here instead, on outlines that have not been thickened yet.
+        #
+        # Why this showed up as a HANG rather than a crash: with --jobs > 1
+        # the fonts go through a fork Pool, and imap_unordered blocks
+        # forever on a worker that died. Observed: rc=124 at 420s, 12/18
+        # outputs, zero stderr -- six faces silently never returned.
         if thickness_pct != 0.0:
+            report["cleaned"] = _cleanup(font)
             if not ref_stem:
                 log.warning(f"  {src.name}: no stem measurement, "
                             f"skipping --thickness")
@@ -554,14 +671,15 @@ def apply_transform(src: Path, dst: Path, width_pct: float, height_pct: float,
                 delta = abs(thickness_pct) / 100.0 * effective
                 sign = 1.0 if thickness_pct > 0 else -1.0
                 applied = 0
-                for glyph in font.glyphs():
-                    try:
-                        glyph.changeWeight(sign * delta)
-                        applied += 1
-                    except Exception as exc:
-                        log.debug(
-                            f"  {glyph.glyphname}: changeWeight failed: "
-                            f"{type(exc).__name__}: {exc}")
+                with _quench_c_stderr():
+                    for glyph in font.glyphs():
+                        try:
+                            glyph.changeWeight(sign * delta)
+                            applied += 1
+                        except Exception as exc:
+                            log.debug(
+                                f"  {glyph.glyphname}: changeWeight failed: "
+                                f"{type(exc).__name__}: {exc}")
                 report["thickness"] = {
                     "ref_stem_input": round(ref_stem, 2),
                     "ref_stem_effective": round(effective, 2),
@@ -585,12 +703,16 @@ def apply_transform(src: Path, dst: Path, width_pct: float, height_pct: float,
                 "glyphs": _add_spacing(font, spacing_pct),
             }
 
-        if (sx != 1.0 or sy != 1.0 or thickness_pct != 0.0
-                or quantize_units or spacing_pct):
+        # Cleanup for the non-thickening path. When thickness_pct != 0 this
+        # already ran, before changeWeight -- see the note above.
+        if thickness_pct == 0.0 and (sx != 1.0 or sy != 1.0
+                                     or quantize_units or spacing_pct):
             report["cleaned"] = _cleanup(font)
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        font.generate(str(dst))
+        type2_errors = _generate_capturing_c_stderr(font, str(dst))
+        if type2_errors:
+            report["type2_errors"] = type2_errors
     finally:
         font.close()
     return report
@@ -689,6 +811,19 @@ def process_font(job) -> tuple[str, bool, list[str]]:
             elif k == "spacing":
                 lines.append(f"  spacing {v['pct']:+g}% on {v['glyphs']} glyphs")
 
+        # The type2 writer reporting coordinates outside its own range is a
+        # real failure, not the per-glyph noise _quench_c_stderr hides. The
+        # file still gets written and still renders, so nothing else in this
+        # script would catch it -- without this the run reported success.
+        type2_errors = rep.get("type2_errors") or []
+        if type2_errors:
+            lines.append(f"  FAIL {len(type2_errors)} type2 range error(s) "
+                         f"during CFF generation:")
+            for msg in type2_errors:
+                lines.append(f"    {msg}")
+            lines.append("  the written file may contain repaired geometry; "
+                         "lower --thickness or inspect the affected glyphs")
+
         # Expected stem through the whole pipeline: width narrows it by
         # sx, thickness then moves it by its own percentage of that.
         expected = (stem * sx * (1.0 + thickness_pct / 100.0)) if stem else None
@@ -716,7 +851,11 @@ def process_font(job) -> tuple[str, bool, list[str]]:
                 lines.append(f"  hinted with {hint_tool}")
             else:
                 lines.append(f"  WARNING hinting skipped ({hint_tool})")
-        return src.name, True, lines
+        # A type2 range error during CFF generation is the one condition here
+        # that produced a plausible-looking output file while the writer had
+        # already reported out-of-range coordinates. Reporting success here
+        # is what let it go unnoticed, so fail the font instead.
+        return src.name, not type2_errors, lines
     except Exception as exc:
         lines.append(f"  FAILED {type(exc).__name__}: {exc}")
         return src.name, False, lines
@@ -798,6 +937,8 @@ and geometry cleanup only.
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    global _QUIET_C_STDERR
+    _QUIET_C_STDERR = not args.verbose
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s - %(message)s", stream=sys.stdout)
@@ -860,9 +1001,34 @@ def main(argv: Optional[list[str]] = None) -> int:
     if workers > 1:
         import multiprocessing as mp
         ctx = mp.get_context("fork")
+        # A worker can die from a C-level crash inside libfontforge, which no
+        # try/except in this script can catch. Observed on FontForge
+        # 20251009: Noto Sans ExtraLight SIGSEGVs during CFF generation
+        # because changeWeight drives one combining mark (hacombcy) to
+        # coordinates ~2.9e12, outside the type2 writer's [-65536, 65535].
+        #
+        # pool.imap_unordered blocks forever on a task whose worker died --
+        # the result is simply never delivered -- so that crash presented as
+        # an infinite HANG: measured rc=124 at 420s with 12/18 outputs and
+        # zero stderr. apply_async with a bounded get() converts it into a
+        # reported failure, and the remaining fonts still complete.
+        # Overridable so a pathological font can be triaged quickly instead
+        # of burning the full budget.
+        PER_FONT_TIMEOUT = int(os.environ.get("OTF_PER_FONT_TIMEOUT", "600"))
         with ctx.Pool(processes=workers) as pool:
-            for name, good, lines in pool.imap_unordered(process_font, jobs):
-                log.info(f"{'ok  ' if good else 'FAIL'} {name}")
+            pending = [(Path(job[0]).name,
+                        pool.apply_async(process_font, (job,)))
+                       for job in jobs]
+            for name, res in pending:
+                try:
+                    rname, good, lines = res.get(timeout=PER_FONT_TIMEOUT)
+                except mp.TimeoutError:
+                    log.error(f"FAIL {name}: no result within "
+                              f"{PER_FONT_TIMEOUT}s -- worker most likely "
+                              f"crashed inside libfontforge (see stderr "
+                              f"'Number out of range' / 'Stack got too big')")
+                    continue
+                log.info(f"{'ok  ' if good else 'FAIL'} {rname}")
                 for ln in lines:
                     log.info(ln)
                 ok += good
