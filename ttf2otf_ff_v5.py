@@ -1405,6 +1405,22 @@ class FringeKiller:
 #  Walk input path and process each TTF
 # ---------------------------------------------------------------------------
 
+def _fontforge_command():
+    """Return the argv prefix that really launches `fontforge -script`.
+
+    `sys.executable` is the FontForge binary ONLY when this module is already
+    running under `fontforge -script`; the embedded interpreter otherwise
+    reports the host's python (e.g. /usr/bin/python3.14). Handing that to
+    -script makes python parse `-script` as `-s -c ript`, so the child dies
+    with rc=1 in ~0.2s and --timeout turns into an instant bogus failure for
+    every face, silently, with no diagnostic. Resolve the real binary instead.
+    """
+    if 'fontforge' in os.path.basename(sys.executable):
+        return [sys.executable, '-script']
+    found = shutil.which('fontforge')
+    return [found, '-script'] if found else None
+
+
 def _run_single_in_subprocess(font_path, out_path, opts, timeout):
     """Convert one font in a child `fontforge -script` and enforce a timeout.
 
@@ -1420,8 +1436,14 @@ def _run_single_in_subprocess(font_path, out_path, opts, timeout):
     crash -- they need different remedies, and conflating them hides which
     one happened.
     """
-    cmd = [sys.executable, '-script', __file__, '--single-font',
-           font_path, out_path]
+    prefix = _fontforge_command()
+    if prefix is None:
+        print("Error: --timeout isolates each font in a child "
+              "`fontforge -script`, but no fontforge binary was found on "
+              "PATH.", file=sys.stderr)
+        return False, False
+    cmd = prefix + [os.path.abspath(__file__), '--single-font',
+                    font_path, out_path]
     for key, value in opts.items():
         flag = '--' + key.replace('_', '-')
         if value is True:
