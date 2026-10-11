@@ -317,6 +317,13 @@ def skia_to_recording(path):
     ops = []
     cur = None
     dropped = 0
+    # Points each verb contributes, keyed by substring of its name. Iter
+    # yields the current point FIRST, then the verb's own points, so a verb
+    # of arity n is read as the LAST n points of its item. Reading them from
+    # the front instead takes the previous point as this verb's first
+    # coordinate and shifts the whole segment along by one -- see below.
+    arity = (("Move", 1), ("Line", 1), ("Cubic", 3), ("Quad", 2),
+             ("Conic", 2), ("Close", 0))
     try:
         it = skia.Path.Iter(path, False)
     except Exception:
@@ -326,6 +333,20 @@ def skia_to_recording(path):
         verb = item[0]
         pts = item[1] if len(item) > 1 else ()
         vname = str(getattr(verb, "name", verb))
+        need = None
+        for key, n in arity:
+            if key in vname:
+                need = n
+                break
+        if need is None or need == 0:
+            if need == 0:
+                if "Close" in vname:
+                    ops.append(("closePath", ()))
+                    cur = None
+            continue
+        if len(pts) < need:
+            continue
+        pts = tuple(pts[len(pts) - need:])
 
         if "Move" in vname:
             cur = xyz(pts[0])
@@ -334,22 +355,22 @@ def skia_to_recording(path):
             cur = xyz(pts[0])
             ops.append(("lineTo", (cur,)))
         elif "Cubic" in vname:
-            if len(pts) < 3:
-                continue
             c1, c2, p3 = xyz(pts[0]), xyz(pts[1]), xyz(pts[2])
             ops.append(("curveTo", (c1, c2, p3)))
             cur = p3
         elif "Quad" in vname:
-            if len(pts) < 2:
-                continue
             c, p = xyz(pts[0]), xyz(pts[1])
             c1, c2 = _quad_to_cubic(cur if cur is not None else c, c, p)
             ops.append(("curveTo", (c1, c2, p)))
             cur = p
         elif "Conic" in vname:
             dropped += 1
-            if len(pts) >= 3:
-                cur = xyz(pts[2])
+            # Weight is not readable through this build's iterators, so the
+            # segment is dropped rather than guessed at.
+            cur = xyz(pts[-1])
+        elif "Close" in vname:
+            ops.append(("closePath", ()))
+            cur = None
         elif "Close" in vname:
             ops.append(("closePath", ()))
             cur = None
@@ -482,22 +503,48 @@ class StraightenPen:
         self.stats = stats
         self._pt = None
 
-    def _source_was_straight(self, p3):
-        """True only when the nearest source segment was a real LINE.
+    def _source_was_straight(self, c1, c2, p3):
+        """True only when the source was straight AND the candidate is flat.
 
-        No tolerance is needed, and using one is actively harmful. By
-        this point every source quadratic has been promoted to a cubic
-        (ops_to_cubic_ops), so a source cubic is a genuine curve and a
-        source line is a genuine straight edge. Comparing bows and
-        allowing "near-flat" cubics to count as straight made this pass
-        flatten real curves: measured on this font, e'/'o'/'S' all came
-        out with every segment at bow 0.00u -- a polygon approximation
-        that merely looks smooth at small sizes.
+        Two independent conditions, both required:
 
-        Matching is by nearest midpoint, which is approximate, so the
-        criterion has to be exact or the pass over-reaches.
+        1. The nearest source segment must be a real LINE. By this point
+           every source quadratic has been promoted to a cubic
+           (ops_to_cubic_ops), so a source cubic is a genuine curve and a
+           source line is a genuine straight edge.
+        2. The candidate cubic must itself be flat, within src_tol.
+
+        Condition 1 alone is not enough, and the reason is that nearest
+        midpoint matching is genuinely ambiguous here. After stroke and
+        union the stroke-generated geometry sits only a fraction of a unit
+        off the source outline, so a bowed candidate's midpoint can be
+        nearer to some unrelated straight source segment than to the
+        segment it came from. Measured on NotoSans-Regular at
+        --thickness 1: 3,882 candidates matched a source line, and 918 of
+        those had a bow of 0.5u or more -- up to 51.7u on a 282u segment.
+        Flattening those draws chords across the glyph: 'e' grew a
+        straight bar straight across its upper counter.
+
+        A distance cap was tried to disambiguate and does not work. The
+        good and bad candidates overlap almost completely in distance
+        (median 26.6u vs 19.4u, p90 52.6u vs 51.2u), so every cap that
+        kept the good ones also kept most of the bad ones: at <=32u it
+        still wrongly flattened 700 of 918. Bow is what separates them.
+
+        This is not the bow comparison this pass used to make and reject.
+        That one compared bows against the SOURCE and let a near-flat
+        source count as straight, so genuinely curved sources were
+        flattened too, leaving e'/'o'/'S' with every segment at bow
+        0.00u -- a polygon approximation that merely looks smooth when
+        small. Here src_tol is an absolute veto applied to the CANDIDATE,
+        on top of an unchanged exact-line test on the source: a bowed
+        candidate is left as a curve, never turned into a line. The check
+        can therefore only remove flattening, never add it.
         """
         if not self.src_mids:
+            return False
+        bow, _length = _bow(self._pt, c1, c2, p3)
+        if bow > self.src_tol:
             return False
         mid = ((self._pt[0] + p3[0]) / 2.0, (self._pt[1] + p3[1]) / 2.0)
         best, bestd = None, None
@@ -518,7 +565,7 @@ class StraightenPen:
     def curveTo(self, *points):
         for i in range(0, len(points) - 2, 3):
             c1, c2, p3 = points[i], points[i + 1], points[i + 2]
-            if self._pt is not None and self._source_was_straight(p3):
+            if self._pt is not None and self._source_was_straight(c1, c2, p3):
                 self.out.lineTo(p3)
                 self.stats["flattened"] += 1
             else:
