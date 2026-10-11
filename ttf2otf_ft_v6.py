@@ -28,7 +28,9 @@ WHAT MATCHES v6.0
     --width PCT      X-only scale of geometry and advances
     --thickness N    embolden by N font units (stroke + union)
     --quantise-curve N
-                     curve-flattening tolerance passed to Qu2CuPen
+                     flatten curves to within N/1000 em; 0 = off (default).
+                     Applied after all geometry stages, as a tolerance
+                     (lower = finer), not the FontForge divisor.
     --blue-quantise N
                      round CFF BlueValues to an N-unit grid
     --gasp/--no-gasp write a GASP table (0x03 under 8ppem, 0x0F above)
@@ -414,6 +416,92 @@ def embolden(path, delta):
     return skia.Op(stroked, path, skia.PathOp.kUnion_PathOp)
 
 
+def _flatten_ops(ops, max_err):
+    """Re-emit ops, replacing every cubic with line segments.
+
+    Each cubic is flattened to within max_err font units of the true curve,
+    by recursive subdivision until the curve is flat enough.
+
+    This is what --quantise-curve drives. It used to drive nothing: the
+    value was parsed, forwarded to the --single-font child, and then never
+    read, so the flag was inert while its help text described a Qu2CuPen
+    pass that no code performed.
+
+    Why not fontTools' pens: Qu2CuPen only promotes QUADRATICS. Its
+    all_cubic argument is consulted inside quadratic_to_curves and nowhere
+    else, so curveTo passes cubics through untouched at any tolerance,
+    including max_err=0.0005 em where a quarter circle of r=100 must break
+    into ~14 segments. Verified, not assumed: both Qu2CuPen alone and
+    Cu2QuPen->Qu2CuPen returned a quarter circle as one cubic, unchanged, at
+    every tolerance tried. By this point in the pipeline every curve is
+    already a cubic anyway -- ops_to_cubic_ops promotes the source quads and
+    skia emits cubics only -- so neither pen is the right tool here.
+
+    max_err is in font units; the CLI value is divided by upm by the caller.
+    """
+    tol = max(0.0, float(max_err))
+    out = []
+    cur = None
+
+    def flat(p0, c1, c2, p3):
+        """Max distance of the control points from the chord p0-p3."""
+        dx = p3[0] - p0[0]
+        dy = p3[1] - p0[1]
+        d = math.hypot(dx, dy)
+        if d <= tol:
+            return True
+        # control-point distance bounds the curve's deviation from the chord
+        return (max(_line_dist(p0, p3, c1), _line_dist(p0, p3, c2)) <= tol)
+
+    def emit(p0, c1, c2, p3, depth):
+        if depth >= 18 or flat(p0, c1, c2, p3):
+            out.append(("lineTo", (p3,)))
+            return
+        left, right = _split_cubic(p0, c1, c2, p3)
+        emit(*left, depth + 1)
+        emit(*right, depth + 1)
+
+    for op, args in ops:
+        if op == "moveTo":
+            cur = args[0]
+            out.append(("moveTo", (cur,)))
+        elif op == "lineTo":
+            cur = args[0]
+            out.append(("lineTo", (cur,)))
+        elif op == "curveTo":
+            p3 = args[2]
+            if cur is None or tol <= 0:
+                out.append(("curveTo", args))
+            else:
+                emit(cur, args[0], args[1], p3, 0)
+            cur = p3
+        elif op in ("closePath", "endPath"):
+            out.append((op, args))
+            if op == "closePath":
+                cur = None
+    return out
+
+
+def _line_dist(a, b, p):
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    d = math.hypot(dx, dy)
+    if d == 0:
+        return math.hypot(p[0] - a[0], p[1] - a[1])
+    return abs((p[0] - a[0]) * dy - (p[1] - a[1]) * dx) / d
+
+
+def _split_cubic(p0, c1, c2, p3):
+    """Split a cubic at t=0.5; return ((l0,l1,l2,l3), (r0,r1,r2,r3))."""
+    m01 = ((p0[0] + c1[0]) / 2.0, (p0[1] + c1[1]) / 2.0)
+    m12 = ((c1[0] + c2[0]) / 2.0, (c1[1] + c2[1]) / 2.0)
+    m23 = ((c2[0] + p3[0]) / 2.0, (c2[1] + p3[1]) / 2.0)
+    m012 = ((m01[0] + m12[0]) / 2.0, (m01[1] + m12[1]) / 2.0)
+    m123 = ((m12[0] + m23[0]) / 2.0, (m12[1] + m23[1]) / 2.0)
+    mid = ((m012[0] + m123[0]) / 2.0, (m012[1] + m123[1]) / 2.0)
+    return (p0, m01, m012, mid), (mid, m123, m23, p3)
+
+
 # ---------------------------------------------------------------------------
 # Phase 8b -- straighten curves that were straight in the source
 # ---------------------------------------------------------------------------
@@ -674,6 +762,15 @@ def convert_glyphs(font, args, stats):
         # non-zero filling. Done last, once all geometry is final.
         ops = fix_cff_winding(ops)
 
+        # Curve flattening, driven by --quantise-curve. Runs after every
+        # geometry stage so it sees the final outline, including the stroke
+        # and union from --thickness and the straightening in Phase 8b.
+        if args.quantise_curve > 0:
+            before = sum(1 for op, _ in ops if op == "curveTo")
+            ops = _flatten_ops(ops, args.quantise_curve * upem / 1000.0)
+            after = sum(1 for op, _ in ops if op == "curveTo")
+            stats["flattened"] += before - after
+
         if not ops:
             # Blank glyph (space, combining mark, .notdef on some fonts):
             # keep the advance, emit a width-only charstring.
@@ -901,8 +998,10 @@ def main():
                          "+ vertical metrics)")
     ap.add_argument("--spacing", type=float, default=0,
                     help="advance-width change, percent; outlines untouched")
-    ap.add_argument("--quantise-curve", type=int, default=50,
-                    help="curve flattening tolerance in 1/1000 em")
+    ap.add_argument("--quantise-curve", type=int, default=0,
+                    help="curve flattening tolerance in 1/1000 em; "
+                         "0 (default) disables flattening. The value was "
+                         "accepted and silently ignored before v6.1")
     ap.add_argument("--blue-quantise", type=int, default=1,
                     help="round CFF BlueValues to this unit grid")
     ap.add_argument("-a", "--aggression",
