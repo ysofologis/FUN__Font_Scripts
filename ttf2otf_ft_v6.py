@@ -676,17 +676,32 @@ class StraightenPen:
         self._pt = None
 
 
+def _scale_pt(p, sx, sy):
+    """Scale one pen point, preserving the None end-of-contour marker.
+
+    A trueTypeGlyphs qCurveTo may end with None: that is not a coordinate but
+    the pen protocol's "this contour has no on-curve point" flag (all eight
+    points are off-curve control points, e.g. an 'O' drawn as two conic
+    circles). Scaling it as a coordinate raises TypeError. It must survive
+    the transform untouched so ops_to_cubic_ops() can still infer the
+    implied on-curve points.
+    """
+    if p is None:
+        return None
+    return (p[0] * sx, p[1] * sy)
+
+
 def transform_ops(ops, sx, sy):
     if sx == 1.0 and sy == 1.0:
         return ops
     out = []
     for op, args in ops:
         if op == "moveTo" or op == "lineTo":
-            out.append((op, ((args[0][0] * sx, args[0][1] * sy),)))
+            out.append((op, (_scale_pt(args[0], sx, sy),)))
         elif op == "curveTo":
-            out.append((op, tuple((a[0] * sx, a[1] * sy) for a in args)))
+            out.append((op, tuple(_scale_pt(a, sx, sy) for a in args)))
         elif op == "qCurveTo":
-            out.append((op, tuple((a[0] * sx, a[1] * sy) for a in args)))
+            out.append((op, tuple(_scale_pt(a, sx, sy) for a in args)))
         else:
             out.append((op, args))
     return out
