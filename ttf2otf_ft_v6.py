@@ -533,6 +533,16 @@ def _quad_to_cubic(p0, q, p2):
     return c1, c2
 
 
+def _implied_start(offs):
+    """Start point implied by an all-off-curve contour.
+
+    TrueType may store a contour with no on-curve point at all; the implied
+    one is the midpoint between the last and first control points.
+    """
+    return ((offs[-1][0] + offs[0][0]) / 2.0,
+            (offs[-1][1] + offs[0][1]) / 2.0)
+
+
 def _segments(ops):
     """Split a recording into (seg, is_new_contour) pairs.
 
@@ -562,9 +572,27 @@ def _segments(ops):
             cur = args[2]
         elif op == "qCurveTo":
             pts = [p for p in args if p is not None]
-            end = cur if args and args[-1] is None else (
-                pts[-1] if pts else cur)
-            offs = pts[:-1] if pts else []
+            all_off = bool(args) and args[-1] is None
+            # A trailing None marks an all-off-curve contour: there is no
+            # on-curve endpoint, so EVERY element of pts is a control point.
+            # Stripping the last one (as pts[:-1] does) loses a real control
+            # point and emits one quad too few, which draws the counter as a
+            # teardrop rather than an oval.
+            offs = pts if all_off else pts[:-1]
+            end = cur if all_off else (pts[-1] if pts else cur)
+            # A contour may begin with drawing ops directly after a
+            # closePath, with no moveTo to seed it -- that is exactly how
+            # a TrueType counter is emitted (Ordina 'O': moveTo, qCurveTo,
+            # closePath, qCurveTo, closePath -- two contours, one moveTo).
+            # closePath sets cur=None, so without this the second contour
+            # was dropped by the `cur is not None` guard and the counter
+            # vanished entirely: 'O' rendered as a solid disc. An
+            # all-off-curve contour closes on the implied on-curve point
+            # between its last and first control points.
+            if cur is None and offs:
+                cur = _implied_start(offs)
+                end = cur
+                fresh = True
             if cur is not None and end is not None:
                 for i, q in enumerate(offs):
                     nxt = end if i == len(offs) - 1 else \
