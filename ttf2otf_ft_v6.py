@@ -869,6 +869,20 @@ def build_output(font, charstrings, widths, args, out_path):
     style = font["name"].getDebugName(2) or "Regular"
     full = font["name"].getDebugName(4) or "%s %s" % (family, style)
     ps = font["name"].getDebugName(6) or "Regular"
+    src_uid = font["name"].getDebugName(3) or full
+
+    # setupNameTable() only writes the six keys it is handed, so any other
+    # name record in the source is silently dropped. Core Sans C relies on
+    # 16/17 (Windows Typographic Family/Subfamily): without them the font
+    # reported "Core Sans C 45 Regular" as its family name in Windows, which
+    # splits one family across 18 faces instead of showing a family with
+    # styles. Carry every source record across, letting the six keys above
+    # keep priority so an existing ID3 is not overwritten with the filename.
+    src_name_records = [
+        (r.nameID, r.platformID, r.platEncID, r.langID, str(r))
+        for r in font["name"].names
+    ]
+    keep = {1, 2, 3, 4, 5, 6}
 
     info = {
         "FullName": full,
@@ -914,7 +928,25 @@ def build_output(font, charstrings, widths, args, out_path):
         "fullName": full,
         "psName": ps,
         "version": "Version 1.000",
+        # Name ID 3 is the vendor's unique identifier
+        # ("S-CoreCo.,Ltd.: Core Sans C 45 Regular: 2016"). FontBuilder
+        # derives it from fullName when the key is absent, so leaving it
+        # out replaces the real UID with the filename and breaks the
+        # vendor's ability to identify the face. Carry the source value.
+        "uniqueFontIdentifier": src_uid,
     })
+    # Restore every source name record that setupNameTable did not write.
+    # IDs 1/2/4/5/6 are deliberately left alone: FontBuilder derives them
+    # from the keys above, and 3 is the one record the script must own.
+    if src_name_records:
+        name_tbl = fb.font["name"]
+        written = {r.nameID for r in name_tbl.names}
+        for name_id, plat_id, enc_id, lang_id, val in src_name_records:
+            if name_id in keep or name_id in written:
+                continue
+            name_tbl.setName(val, name_id, plat_id, enc_id, lang_id)
+        name_tbl.names.sort(key=lambda r: (r.platformID, r.platEncID,
+                                           r.langID, r.nameID))
     # cmap must exist before OS/2: FontBuilder asserts the order when it
     # resolves the code-page ranges, so a missing cmap is a hard failure.
     if "cmap" in font and font.getBestCmap():
