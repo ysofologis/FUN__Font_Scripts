@@ -66,6 +66,7 @@ Usage:
 
 import argparse
 import math
+import re
 import os
 import shutil
 import subprocess
@@ -78,6 +79,7 @@ try:
     from fontTools.pens.t2CharStringPen import T2CharStringPen
     from fontTools.fontBuilder import FontBuilder
     from fontTools.ttLib import TTFont, newTable
+    from fontTools.ttLib.tables.O_S_2f_2 import Panose
 except ImportError as exc:
     print("Error: fontTools is required (pip install fonttools)", file=sys.stderr)
     raise SystemExit(1)
@@ -543,6 +545,156 @@ def _implied_start(offs):
             (offs[-1][1] + offs[0][1]) / 2.0)
 
 
+def _is_italic(*texts):
+    low = " ".join(t for t in texts if t).lower()
+    return "italic" in low or "oblique" in low
+
+
+def _is_bold(*texts):
+    return any(_is_bold_word(w) for t in texts if t
+               for w in re.split(r"[^A-Za-z]+", t) if w)
+
+
+def _is_bold_word(w):
+    """True for words that actually mean bold.
+
+    Substring matching was wrong here: 'Extra Bold' and 'Semi Bold' both
+    contain 'bold', but collapsing them onto plain 'Bold' made three distinct
+    weights claim one name ID 17, which is the collision Golca reported.
+    Exact tokens are matched instead, with the common compounds spelled out.
+    """
+    k = re.sub(r"[^a-z]", "", w.lower())
+    return k in ("bold", "black", "heavy", "extrabold", "extrablack",
+                 "ultrabold", "ultrablack", "semibold", "demibold",
+                 "heavyitalic", "blackitalic", "bolditalic")
+
+
+# Style words that carry no bold/italic bit but still name a distinct face.
+# Without these a "Thin" or "Extra Light" face recovers nothing and falls
+# back to REGULAR, which is what made Golca's light weights collide with
+# its regular.
+_STYLE_WORDS = frozenset((
+    "regular", "italic", "oblique", "bold", "black", "heavy", "extrabold",
+    "extrablack", "ultrabold", "ultrablack", "semibold", "demibold",
+    "book", "medium", "roman", "normal", "light", "extralight", "ultralight",
+    "thin", "hairline", "extrathin", "ultrathin", "condensed", "expanded",
+    "semilight", "demilight", "spaced", "display", "text", "mono",
+    # Intensity qualifiers. Without these 'Extra Bold' lost the 'Extra' and
+    # collapsed onto plain 'Bold', so Extra Bold and Semi Bold and Bold all
+    # claimed one name ID 17 -- the collision that started this.
+    "extra", "ultra", "semi", "demi", "super", "hyper", "ultra",
+))
+
+
+def _is_style_word(w):
+    if not w:
+        return False
+    key = re.sub(r"[^a-z]", "", w.lower())
+    return bool(key) and (key in _STYLE_WORDS
+                          or "bold" in key or "black" in key
+                          or "light" in key or "italic" in key
+                          or "oblique" in key)
+
+
+def _style_bits(family, style, ps):
+    """Derive (bold, italic) from the face's own names."""
+    return _is_bold(style, ps), _is_italic(style, ps, family)
+
+
+def _fs_selection(font, family, style, ps, resolved_style=None):
+    """OS/2.fsSelection, bit 0 italic / bit 5 bold / bit 6 regular.
+
+    setupOS2() did not accept fsSelection, so every font this script wrote
+    carried fsSelection=0: no bold and no italic bit anywhere, and browsers
+    fell back to family-name matching. Golca made this obvious -- all 16
+    faces declare fsSelection=REGULAR and subfamily "Regular", so nothing in
+    the source distinguished upright from italic either and the italics
+    collided with their uprights.
+
+    Trust the source's own bits when it sets any of them; otherwise derive
+    them from the names, which is what the name table is for. REGULAR is only
+    set when the face is neither bold nor italic -- a "Bold" face must never
+    claim REGULAR, since that is what made the two collide.
+    """
+    bold, italic = _style_bits(family, resolved_style or style, ps)
+    src = 0
+    if "OS/2" in font:
+        try:
+            src = font["OS/2"].fsSelection
+        except Exception:
+            src = 0
+    # Bit 8 (USE_TYPO_METRICS) is unrelated to bold/italic and must survive:
+    # dropping it makes a font fall back on hhea/OS/2 win metrics and shifts
+    # every line of text. Preserve all non-style bits from the source.
+    passthrough = src & ~0x23
+    use_src = bool(src & (1 | 32))
+    if use_src:
+        bold = bool(src & 32)
+        italic = bool(src & 1)
+    val = passthrough
+    if italic:
+        val |= 1
+    if bold:
+        val |= 32
+    if not (val & (1 | 32)):
+        val |= 64
+    return val
+
+
+def _mac_style(family, style, ps):
+    """head.macStyle: bit 0 bold, bit 1 italic."""
+    bold, italic = _style_bits(family, style, ps)
+    val = 0
+    if bold:
+        val |= 1
+    if italic:
+        val |= 2
+    return val
+
+
+def _panose_for(style, ps):
+    """Keep a sane PANOSE: bWeight tracks bold, bMidline carries the slant.
+
+    FontBuilder writes a default PANOSE when none is given, which claims
+    weight 0 and slant 0 for every face regardless of what it is.
+    Note the field names: bFamilyType (not bFamilyKind) and the slant lives
+    in bMidline -- there is no bPosture on fontTools' Panose.
+    """
+    bold, italic = _style_bits("", style, ps)
+    return Panose(bFamilyType=2,            # latin text
+                  bSerifStyle=11,          # normal sans
+                  bWeight=8 if bold else 5,   # bold / book
+                  bProportion=6,           # modern
+                  bContrast=3,             # medium
+                  bStrokeVariation=5 if bold else 0,
+                  bArmStyle=2,
+                  bLetterForm=2,
+                  bMidline=2 if bold else 3,   # 2=slanted when italic
+                  bXHeight=4)
+
+
+def _style_from_names(family, full, ps):
+    """Recover a style string ('Bold Italic') from the face's own names.
+
+    Used only when 16/17 cannot supply it and the legacy subfamily is the
+    default 'Regular', which means the source font never recorded its style
+    anywhere a font browser would read.
+    """
+    for cand in (ps, full):
+        if not cand:
+            continue
+        base = family or ""
+        tail = cand[len(base):].strip() if cand.startswith(base) else cand
+        tail = tail.strip() or cand
+        # normalise separators used across foundries
+        tail = tail.replace("_", " ").replace("-", " ")
+        parts = tail.split()
+        keep = [w for w in parts if _is_style_word(w)]
+        if keep and not all(w.lower() == "regular" for w in keep):
+            return " ".join(keep)
+    return None
+
+
 def _segments(ops):
     """Split a recording into (seg, is_new_contour) pairs.
 
@@ -871,6 +1023,24 @@ def build_output(font, charstrings, widths, args, out_path):
     ps = font["name"].getDebugName(6) or "Regular"
     src_uid = font["name"].getDebugName(3) or full
 
+    # Windows groups a family by 16/17 (Typographic Family/Subfamily);
+    # 1/2 are the legacy RIBBI form that can hold only Regular/Bold/Italic/
+    # Bold Italic. A font with more than four weights has to put the real
+    # style in 16/17 and leave 1/2 at its legacy value.
+    #
+    # Golca has 16='Golca' but no 17 at all, and 2='Regular' on all 16
+    # faces, so its style lives nowhere: every face looked like a Regular
+    # and each italic collided with its upright. When 17 is missing but the
+    # legacy style is the unhelpful default 'Regular', the real style can be
+    # recovered from the face's own names -- which is exactly what 17 should
+    # have said.
+    typo_family = font["name"].getDebugName(16)
+    typo_style = font["name"].getDebugName(17)
+    if not typo_style and (style or "").strip().lower() in ("", "regular"):
+        guessed = _style_from_names(family, full, ps)
+        if guessed:
+            typo_style = guessed
+
     # setupNameTable() only writes the six keys it is handed, so any other
     # name record in the source is silently dropped. Core Sans C relies on
     # 16/17 (Windows Typographic Family/Subfamily): without them the font
@@ -934,6 +1104,8 @@ def build_output(font, charstrings, widths, args, out_path):
         # out replaces the real UID with the filename and breaks the
         # vendor's ability to identify the face. Carry the source value.
         "uniqueFontIdentifier": src_uid,
+        "typographicFamily": typo_family or family,
+        "typographicSubfamily": typo_style or style,
     })
     # Restore every source name record that setupNameTable did not write.
     # IDs 1/2/4/5/6 are deliberately left alone: FontBuilder derives them
@@ -959,8 +1131,15 @@ def build_output(font, charstrings, widths, args, out_path):
                 usWinAscent=font["OS/2"].usWinAscent if "OS/2" in font else upem // 2,
                 usWinDescent=font["OS/2"].usWinDescent if "OS/2" in font else upem // 4,
                 usWeightClass=font["OS/2"].usWeightClass if "OS/2" in font else 400,
-                fsType=0)
+                fsType=0,
+                fsSelection=_fs_selection(font, family, style, ps,
+                                      typo_style or style),
+                panose=_panose_for(typo_style or style, ps))
     fb.setupPost()
+    # macStyle is the Mac/legacy counterpart of OS/2 fsSelection. It is not
+    # set by setupOS2, and FontBuilder.setupHead() does not take it either,
+    # so it has to be assigned after the head table exists.
+    fb.font["head"].macStyle = _mac_style(family, typo_style or style, ps)
     fb.font["head"].flags |= 0x0103
 
     if args.gasp:
