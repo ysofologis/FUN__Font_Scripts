@@ -457,7 +457,17 @@ def _flatten_ops(ops, max_err):
 
     def emit(p0, c1, c2, p3, depth):
         if depth >= 18 or flat(p0, c1, c2, p3):
-            out.append(("lineTo", (p3,)))
+            # A curve that is already flat within tolerance keeps its cubic.
+            # Emitting a lineTo here threw away the curve at EVERY tolerance,
+            # so no setting of --quantise-curve ever preserved one and the
+            # flag could only ever mean "destroy all curves, by a
+            # controllable amount". Keeping the cubic costs nothing when the
+            # curve is flat (it draws the same shape) and is what makes the
+            # fine settings of the flag meaningful.
+            if depth == 0:
+                out.append(("curveTo", (c1, c2, p3)))
+            else:
+                out.append(("lineTo", (p3,)))
             return
         left, right = _split_cubic(p0, c1, c2, p3)
         emit(*left, depth + 1)
@@ -693,6 +703,35 @@ def _style_from_names(family, full, ps):
         if keep and not all(w.lower() == "regular" for w in keep):
             return " ".join(keep)
     return None
+
+
+def _quantise_tolerance(level, upem):
+    """Map a --quantise-curve level to a flattening tolerance in font units.
+
+    HIGHER level = MORE quantisation, so the tolerance must SHRINK as the
+    level rises: a smaller tolerance forces a curve to be split into more
+    line segments. The ladder is the reciprocal of the pre-v6.3 reading,
+    where the value was itself the tolerance:
+
+        level 0     -> curves kept untouched (handled by the caller)
+        level 1     -> 1/1 em     : fully flat, fewest segments
+        level 5     -> 1/5 em     : coarse
+        level 50    -> 1/50 em    : moderate
+        level 100   -> 1/100 em   : fine
+        level 1000+ -> 1/1000 em  : finest, effectively invisible
+
+    Dividing by upem as well keeps the setting font-size independent: level
+    100 produces the same visual flatness at upem 1000 or 2048.
+
+    This is deliberately the inverse of the pre-v6.3 reading, where a bigger
+    number meant a bigger tolerance and therefore a FINER result. A recipe
+    shipped with "--quantise-curve 10" flattened gently; it now flattens
+    hard. Both directions cannot be right, so the help text states the new
+    one plainly and RECIPES.md calls out the change.
+    """
+    if level <= 0:
+        return 0.0
+    return upem / float(level)
 
 
 def _segments(ops):
@@ -960,9 +999,23 @@ def convert_glyphs(font, args, stats):
         # Curve flattening, driven by --quantise-curve. Runs after every
         # geometry stage so it sees the final outline, including the stroke
         # and union from --thickness and the straightening in Phase 8b.
+        #
+        # Direction: HIGHER means MORE quantisation (coarser, fewer curves).
+        # This was the other way round until v6.3 -- the value was a
+        # tolerance in font units, so a bigger number flattened harder and
+        # 1 was the finest setting. It also mirrored ttf2otf_ff_v5.py, where
+        # --quantise-curve is a divisor (tolerance = upem / value) and
+        # smaller is more aggressive. Between them the two scripts asked for
+        # opposite things from the same flag name.
+        #
+        # Now: 0 (default) keeps every cubic; higher values flatten more,
+        # and the tolerance shrinks as upem/value so the setting scales with
+        # the font. The value is kept in 1/1000-em units, so the numbers the
+        # previous releases used now mean the reverse of what they meant.
         if args.quantise_curve > 0:
             before = sum(1 for op, _ in ops if op == "curveTo")
-            ops = _flatten_ops(ops, args.quantise_curve * upem / 1000.0)
+            ops = _flatten_ops(ops, _quantise_tolerance(args.quantise_curve,
+                                                        upem))
             after = sum(1 for op, _ in ops if op == "curveTo")
             stats["flattened"] += before - after
 
@@ -1253,9 +1306,12 @@ def main():
     ap.add_argument("--spacing", type=float, default=0,
                     help="advance-width change, percent; outlines untouched")
     ap.add_argument("--quantise-curve", type=int, default=0,
-                    help="curve flattening tolerance in 1/1000 em; "
-                         "0 (default) disables flattening. The value was "
-                         "accepted and silently ignored before v6.1")
+                    help="how hard to quantise curves into line segments; "
+                         "HIGHER = MORE quantisation. 0 (default) keeps every "
+                         "cubic. The value is in 1/1000 em, so 1 is the "
+                         "finest setting, 100 is clearly faceted and 500+ "
+                         "saturates. Direction was reversed in v6.3: before "
+                         "that, a higher value meant a finer result")
     ap.add_argument("--blue-quantise", type=int, default=1,
                     help="round CFF BlueValues to this unit grid")
     ap.add_argument("-a", "--aggression",
