@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import logging
 import subprocess
 import sys
@@ -17,8 +18,13 @@ class AdobeAFDKOProcessor:
     Provides industry-standard font optimization using makeotf and related tools.
     """
     
-    def __init__(self, verbose=False):
+    def __init__(self, verbose=False, skip_globs=()):
         self.verbose = verbose
+        # Globs of master/variable font filenames to skip. SF-Compact's
+        # variable masters are skipped by default; callers can extend this
+        # with --skip-master. Plain filenames match exactly, anything with
+        # '*' / '?' / '[]' uses fnmatch.
+        self.skip_globs = tuple(skip_globs)
         self.afdko_available = self._check_afdko_availability()
         
     def _check_afdko_availability(self) -> bool:
@@ -70,7 +76,6 @@ class AdobeAFDKOProcessor:
             '-f', str(input_path),           # Input font file
             '-o', str(output_path),          # Output OTF file
             '-r',                            # Release mode (no stubbing)
-            '-gs',                           # Suppress glyph warnings
             '-shw',                          # Don't override OS/2 xHeight, capHeight
             '-omitMacNames'                  # Omit Macintosh name table entries
         ]
@@ -199,6 +204,26 @@ class AdobeAFDKOProcessor:
         if not font_files:
             logging.info(f"No font files found in {input_dir}")
             return
+
+        # SF Compact ships two variable masters (SF-Compact.ttf and
+        # SF-Compact-Italic.ttf) that makeotf cannot process as standalone
+        # -- a variable font carries an fvar table and instances are derived
+        # at runtime. Other variable-font families will hit the same wall;
+        # --skip-master takes a glob so they can be excluded without changing
+        # the script.
+        default_skip = ("SF-Compact.ttf", "SF-Compact-Italic.ttf")
+        skip_set = set(default_skip)
+        for pat in self.skip_globs:
+            for f in font_files:
+                if fnmatch.fnmatch(f.name, pat):
+                    skip_set.add(f.name)
+        before = len(font_files)
+        font_files = [f for f in font_files if f.name not in skip_set]
+        skipped = sorted(set(f.name for f in font_files) ^ set(skip_set))
+        if before != len(font_files):
+            logging.info(
+                f"Skipping {before - len(font_files)} master/variable font(s): "
+                f"{', '.join(sorted(skip_set))}")
             
         logging.info(f"Found {len(font_files)} font files to process")
         
@@ -207,7 +232,7 @@ class AdobeAFDKOProcessor:
         
         for font_file in font_files:
             logging.info(f"Processing {font_file.name}...")
-            output_file = output_dir / f"{font_file.stem}_afdko.otf"
+            output_file = output_dir / f"{font_file.stem}.otf"
             
             # Process directly with makeotf for OTF/TTF files
             if font_file.suffix.lower() in ['.otf', '.ttf']:
@@ -253,10 +278,42 @@ Examples:
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--scale", type=float, default=0,
+        help="NOT SUPPORTED in this script: AFDKO has no geometry transform. "
+             "Apply the same percent X-and-Y scale through ttf2otf_ft_v6.py, "
+             "which understands it. 0 (default) disables scaling."
+    )
+    parser.add_argument(
+        "--spacing", type=float, default=0,
+        help="NOT SUPPORTED in this script: AFDKO has no geometry transform. "
+             "Apply the same percent advance-width change through "
+             "ttf2otf_ft_v6.py, which understands it. 0 (default) disables spacing."
+    )
+    parser.add_argument(
+        "--skip-master", dest="skip_master", action="append", default=[],
+        metavar="GLOB",
+        help="Skip master/variable font files whose name matches GLOB. "
+             "Repeat for multiple globs. SF-Compact's variable masters are "
+             "skipped by default."
+    )
     args = parser.parse_args()
-    
+
+    if args.scale or args.spacing:
+        # Fail loudly rather than silently ignoring a flag the user expected
+        # to take effect. The argument was accepted (so the recipe parses)
+        # but AFDKO cannot perform geometry transforms, and the existing
+        # pipeline does not. Direct the user to the tool that does.
+        logging.error(
+            "--scale and --spacing are not supported by this AFDKO wrapper. "
+            "AFDKO's tx and makeotf do not transform geometry. Run "
+            "ttf2otf_ft_v6.py --scale %.2f --spacing %.2f on the same "
+            "sources, or chain the two scripts."
+            % (args.scale, args.spacing))
+        sys.exit(2)
+
     setup_logging(args.verbose)
-    
+
     input_path = Path(args.input_dir)
     if not input_path.exists():
         logging.error(f"Input directory does not exist: {input_path}")
@@ -264,9 +321,10 @@ Examples:
     if not input_path.is_dir():
         logging.error(f"Input path is not a directory: {input_path}")
         sys.exit(1)
-    
+
     logging.info("Initializing Adobe AFDKO Processor...")
-    processor = AdobeAFDKOProcessor(verbose=args.verbose)
+    processor = AdobeAFDKOProcessor(verbose=args.verbose,
+                                    skip_globs=args.skip_master)
     
     if not processor.afdko_available:
         logging.error("AFDKO tools are not available. Please install Adobe AFDKO:")
