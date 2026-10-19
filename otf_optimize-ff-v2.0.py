@@ -14,6 +14,8 @@ Clean-slate rewrite. Does five things and nothing else:
 Percent semantics throughout, signed: positive grows, negative shrinks.
 All default to 0, which is a verified no-op.
 
+See PERF_NOTES.md for measured wall-clock numbers and the design ceiling.
+
 Single dependency
 -----------------
 FontForge Python bindings only. No fontTools, no pathops, no bridge code.
