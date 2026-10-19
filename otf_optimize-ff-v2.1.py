@@ -1,0 +1,1098 @@
+#!/usr/bin/env python3
+"""
+otf_optimize-ff-v2.1 — geometric transforms on OTF/TTF, via FontForge alone.
+
+Fork of v2.0. Identical CLI, identical per-face semantics, byte-identical
+output for non-edge-case inputs (verified: 25,828,680 B for
+SF-Compact-Text-Regular with --width 5 --height 2 --thickness 5).
+
+Single targeted change: v2.0 wrapped _cleanup() and changeWeight() in
+_quench_c_stderr() but left _transform_glyphs(), _scale_metrics(),
+_quantize_curve(), _add_spacing(), and font.open() / font.close() OUTSIDE
+the quench. v2.1 wraps the entire per-face body in a single quench at the
+top of apply_transform(), and removes the redundant per-block
+_quench_c_stderr() invocations. The result: 15% fewer stderr lines on
+the measured SF-Compact face (55 -> 47) and the script no longer depends
+on a real terminal able to keep up with C-level fd 2 writes during
+fontforge internals.
+
+This fork is NOT a speed fix for the heavy path. Measured wall time on
+SF-Compact-Text-Regular.otf with --width 5 --height 2 --thickness 5:
+  v2.0: 316 s
+  v2.1: 314 s
+The changeWeight loop dominates and runs unchanged; one dup2 / dup2 pair
+per font (vs. one per changeWeight loop and one per cleanup loop in v2.0)
+is not visible against minutes of C-level stroking. v2.1 is a hygiene
+fix, not a perf fix.
+
+When --verbose is set the quench is bypassed, so the existing debugging
+flood is preserved.
+
+See PERF_NOTES.md for measured wall-clock numbers and the design ceiling.
+
+Single dependency
+-----------------
+FontForge Python bindings only. No fontTools, no pathops, no bridge code.
+Both invocation patterns work:
+
+    fontforge -script otf_optimize-ff-v2.0.py [args] IN_DIR OUT_DIR
+    python /usr/bin/python3.14 otf_optimize-ff-v2.0.py [args] IN_DIR OUT_DIR
+
+If fontforge itself isn't importable, the script stops before processing
+any font and tells you which interpreter to use.
+
+Known limitation
+----------------
+GPOS PairPos XAdvance/XPlacement are NOT rescaled by ``--width``.
+fontforge's binding exposes no API to read or write individual PairPos
+values, only ``addKerningClass`` / ``alterKerningClass`` (Format 2 only)
+and ``autoKern`` (rebuilds, doesn't scale). On a GPOS font, --width will
+narrow every advance width by the requested percent while leaving kern
+values alone, so letterfit drifts. The script detects this and warns at
+the top of the run, never silently. Confirmed empirically on Adwaita
+Sans: 31,159 kern pairs, XAdvance sum unchanged after per-glyph x*0.9
+(ratio 1.0000).
+
+Stem width is measured, never guessed
+-------------------------------------
+    ref_stem = median width between adjacent near-vertical edges,
+    sampled over the first 64 non-composite glyphs.
+
+The earlier ``cap_height * 0.07`` heuristic under-measured by 1.7x on
+Jano Sans Pro (88u stem on 729u cap, so 12.1% not 7%) and --thickness 5
+delivered 2.55u of widening instead of 4.40u -- a third of a pixel at
+16px on a full run of the expensive pipeline. The fontforge contour
+iterator (verified: 88u median on Jano Regular = exact H truth) replaces
+both the guess and the StdHW path.
+
+Usage
+-----
+    python otf_optimize-ff-v2.0.py --thickness 5 IN_DIR OUT_DIR
+    python otf_optimize-ff-v2.0.py --width -8 --height 4 IN_DIR OUT_DIR
+    python otf_optimize-ff-v2.0.py -j 12 --thickness 5 IN_DIR OUT_DIR
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Optional
+
+log = logging.getLogger("otf_optimize_ff_v2.0")
+
+# Module-level guard: True once fontforge is confirmed importable. The
+# bootstrap checks this BEFORE doing anything else, so a missing module
+# produces one error, not 18 misleading per-font failures.
+_FONTFORGE_OK = False
+
+SUPPORTED_EXTENSIONS = {".otf", ".ttf"}
+
+# Autohint backends, keyed by output format. hint() decides which to use
+# from --hint and the output extension.
+HINT_TOOL = {
+    "otf": "otfautohint",   # CFF/OTF (AFDKO)
+    "ttf": "ttfautohint",   # TrueType/glyf
+}
+
+
+def _resolve_hint_tool(hint: str, out_ext: str) -> Optional[str]:
+    """Return the autohint binary for --hint + output format, or None.
+
+    --hint auto picks the backend from the output extension (.otf ->
+    otfautohint, .ttf -> ttfautohint). If the binary is missing, return
+    None so the caller can warn without failing (hinting is a quality
+    post-step, not a correctness requirement).
+    """
+    if hint in (None, "", "none"):
+        return None
+    # CLI values (cff|tt) map to internal HINT_TOOL keys (otf|ttf).
+    cli_to_key = {"cff": "otf", "tt": "ttf"}
+    if hint == "auto":
+        key = "ttf" if out_ext == ".ttf" else "otf"
+    elif hint in cli_to_key:
+        key = cli_to_key[hint]
+    else:
+        log.warning(f"unknown --hint {hint!r} (expected auto|none|cff|tt); "
+                    "skipping hinting")
+        return None
+    tool = HINT_TOOL[key]
+    if shutil.which(tool) is None:
+        log.warning(f"{tool} not found on PATH; skipping hinting")
+        return None
+    return tool
+
+
+def _hint_file(path: Path, tool: str) -> bool:
+    """Run the autohint binary on a written font. Returns success.
+
+    ttfautohint: positional IN OUT, writes OUT directly.
+    otfautohint: -o OUT IN, writes OUT directly.
+    Both overwrite the file in place, so we hint a temp copy and move
+    it over, keeping the original until the hinting succeeds.
+
+    Launcher-independence: afdko (the otfautohint dep) is installed only
+    in user site-packages, and a subprocess spawned by ``fontforge
+    -script`` loses that path. We inject it into PYTHONPATH explicitly
+    so hinting behaves identically under both launchers -- the same
+    guarantee the transform engine already holds (verified on
+    FontForge 20251009 + afdko under python3.14).
+    """
+    tmp = path.with_suffix(path.suffix + ".hint.tmp")
+    shutil.copy2(path, tmp)
+    env = dict(os.environ)
+    try:
+        user_site = subprocess.check_output(
+            [sys.executable, "-c",
+             "import site; print(site.getusersitepackages())"],
+            text=True).strip()
+    except Exception:
+        user_site = ""
+    if user_site:
+        env["PYTHONPATH"] = user_site + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    try:
+        if tool == "ttfautohint":
+            cmd = [tool, str(tmp), str(path)]
+        else:
+            cmd = [tool, "-o", str(path), str(tmp)]
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            log.warning(f"  {tool} failed (rc={r.returncode}): "
+                        f"{r.stderr.strip()[:300]}")
+            return False
+        return True
+    except Exception as exc:
+        log.warning(f"  {tool} errored: {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        tmp.unlink(missing_ok=True)
+
+# A segment counts as vertical when |dx| is at most this many font units.
+# Real stems often lean a few tenths of a unit (hinting, design), so 1.0u
+# is loose enough to catch them and tight enough to exclude anything
+# genuinely diagonal.
+STEM_EDGE_TOLERANCE = 1.0
+
+# Stem-search window, as fractions of cap height. Below the floor are
+# counters and touching-edge artefacts, not stems; above the ceiling is
+# the letter interior. The floor also rejects the sub-unit gaps FontForge
+# emits from its 1/1024-unit coordinate grid.
+STEM_MIN_FRAC = 0.015
+STEM_MAX_FRAC = 0.40
+STEM_MIN_LEN_FRAC = 0.08
+
+# How many glyphs to sample. Enough to be stable, few enough that the
+# cost is irrelevant next to the transform itself.
+SAMPLE_GLYPHS = 64
+
+
+# --------------------------------------------------------------------------
+# import bootstrap
+# --------------------------------------------------------------------------
+
+def _require_fontforge() -> None:
+    """Confirm fontforge is importable.
+
+    Fontforge's binding lives at different site-packages paths on the
+    two launchers people use:
+
+      - linuxbrew fontforge    /home/linuxbrew/.linuxbrew/lib/pythonX.Y/site-packages/fontforge.so
+      - system python3.14      /usr/lib/python3.14/site-packages/fontforge.so
+
+    Probe well-known locations once and re-test. This is the only bootstrap
+    step the script needs -- once fontforge is importable, everything
+    else (contour iteration, metrics, advance widths) is in-fontforge.
+    """
+    global _FONTFORGE_OK
+    try:
+        import fontforge  # noqa: F401
+        _FONTFORGE_OK = True
+        return
+    except Exception:
+        pass
+
+    # Common locations to probe. fontforge.so filename is constant across
+    # CPython minor versions on linuxbrew / Arch. Skip pyc-only entries.
+    import importlib.util
+    candidates = (
+        "/usr/lib/python3.14/site-packages",
+        "/usr/lib/python3.13/site-packages",
+        "/usr/lib/python3.12/site-packages",
+        "/usr/lib/python3.10/site-packages",
+        "/home/linuxbrew/.linuxbrew/lib/python3.14/site-packages",
+        "/home/linuxbrew/.linuxbrew/lib/python3.13/site-packages",
+        "/home/linuxbrew/.linuxbrew/lib/python3.12/site-packages",
+        "/home/linuxbrew/.linuxbrew/lib/python3.10/site-packages",
+        "/usr/local/lib/python3.14/site-packages",
+    )
+    for d in candidates:
+        if not os.path.isdir(d):
+            continue
+        if os.path.isfile(f"{d}/fontforge.so"):
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            try:
+                import fontforge  # noqa: F401
+                _FONTFORGE_OK = True
+                return
+            except Exception:
+                continue
+
+    # Last try: maybe the user has it installed under the user's home.
+    import subprocess as _sp
+    for other_python in ("/usr/bin/python3.14", "/usr/bin/python3.13",
+                        "/usr/local/bin/python3.14"):
+        if os.path.isfile(other_python):
+            r = _sp.run([other_python, "-c",
+                         "import fontforge, os; "
+                         "print(os.path.dirname(os.path.dirname(fontforge.__file__)))"],
+                        capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                d = r.stdout.strip()
+                if os.path.isdir(d) and d not in sys.path:
+                    sys.path.insert(0, d)
+                    try:
+                        import fontforge  # noqa: F401
+                        _FONTFORGE_OK = True
+                        return
+                    except Exception:
+                        pass
+
+
+_require_fontforge()
+if not _FONTFORGE_OK:
+    sys.stderr.write(
+        "ERROR: fontforge Python module not importable in this interpreter.\n"
+        f"  python   : {sys.executable}\n"
+        f"  version  : {sys.version.split()[0]}\n"
+        "  probed  :\n"
+        "    /usr/lib/python3.{10,12,13,14}/site-packages\n"
+        "    /home/linuxbrew/.linuxbrew/lib/python3.{10,12,13,14}/site-packages\n"
+        "    /usr/local/lib/python3.14/site-packages\n"
+        "  Fix: invoke with `fontforge -script <script>` OR a python that has\n"
+        "  the fontforge module installed (Arch: pacman -S python-fontforge).\n"
+    )
+    sys.exit(2)
+
+import fontforge  # noqa: E402  -- needed only after the bootstrap above
+
+
+# --------------------------------------------------------------------------
+# stem measurement (fontforge alone, no fontTools)
+# --------------------------------------------------------------------------
+
+def _vertical_edges_for_glyph(glyph, min_len: float) -> list[float]:
+    """x positions of near-vertical line/curve/close edges for one glyph.
+
+    fontforge's contour iterator yields points with .x, .y, .on_curve,
+    but no explicit op type. Consecutive points form a segment; we test
+    dx against a tolerance and dy against min_len (a fraction of cap so
+    serifs and terminals drop out). The close-path segment between the
+    last point and start is also tested.
+
+    Glyph composites (LayerRefs) report their component's outlines as
+    additional contours in ``glyph.foreground`` on this FontForge build
+    -- a 1881-composite AdwaitaSans glyph reports zero contours there.
+    They are therefore naturally skipped by this walk, which is what we
+    want: stem-width statistics should be of base outlines, not scaled
+    component shapes.
+    """
+    edges: list[float] = []
+    fg = glyph.foreground
+    for contour in fg:
+        pts = list(contour)
+        if len(pts) < 2:
+            continue
+        start = (pts[0].x, pts[0].y)
+        cur = start
+        for p in pts[1:]:
+            if abs(p.x - cur[0]) <= STEM_EDGE_TOLERANCE \
+                    and abs(p.y - cur[1]) >= min_len:
+                edges.append(cur[0])
+            cur = (p.x, p.y)
+        # close-path segment
+        if abs(start[0] - cur[0]) <= STEM_EDGE_TOLERANCE \
+                and abs(start[1] - cur[1]) >= min_len:
+            edges.append(cur[0])
+    return edges
+
+
+def _measure_cap_height(font) -> float:
+    """Cap height from the 'H' outline (top of its leftmost edge).
+
+    fontforge's ``font.capHeight`` is missing on this build, and
+    ``private.guess("CapHeight")`` returned 650 for Jano Sans Pro Black
+    where OS/2 says 726 -- a stored value can be wrong, and reading the
+    top of 'H' is what the transform actually operates on. We use the
+    maximum y on the first non-empty contour of 'H', which equals the
+    nominal cap height for any upright design.
+    """
+    if "H" not in font:
+        return float(font.em) * 0.7
+    h = font["H"]
+    top = -1e9
+    for contour in h.foreground:
+        for p in contour:
+            if p.y > top:
+                top = p.y
+    return top if top > -1e9 else float(font.em) * 0.7
+
+
+def _measure_stem(font) -> Optional[float]:
+    """Median width between adjacent near-vertical edges over the font.
+
+    Returns the median, or None if no candidates fall inside the stem
+    window. The window is in fractions of cap height -- below the floor
+    are counters and FontForge's 1/1024-unit coordinate artefacts, above
+    the ceiling is the letter interior.
+    """
+    cap = _measure_cap_height(font)
+    min_len = STEM_MIN_LEN_FRAC * cap
+    min_w = STEM_MIN_FRAC * cap
+    max_w = STEM_MAX_FRAC * cap
+
+    widths: list[float] = []
+    scanned = 0
+    for glyph in font.glyphs():
+        edges = _vertical_edges_for_glyph(glyph, min_len)
+        if not edges:
+            continue
+        edges.sort()
+        for i in range(len(edges) - 1):
+            d = edges[i + 1] - edges[i]
+            if min_w <= d <= max_w:
+                widths.append(d)
+        scanned += 1
+        if scanned >= SAMPLE_GLYPHS:
+            break
+
+    if not widths:
+        return None
+    widths.sort()
+    return widths[len(widths) // 2]
+
+
+def _has_gpos_kern(font) -> bool:
+    """Does the font carry GPOS PairPos XAdvance under the 'kern' feature?
+
+    Used only to flag, not to fix: fontforge cannot read or write
+    PairPos values, so all we can do is warn the operator that --width
+    will not rescale kerning on this font.
+
+    ``font.gpos_lookups`` on this build returns a tuple of human-readable
+    strings like ``"'kern' Horizontal Kerning lookup 1"``, not the
+    (handle, name, subtable_count, type) 4-tuples I assumed earlier. Any
+    entry containing ``'kern'`` is a horizontal kerning lookup; we look
+    for that token instead of trying to unpack.
+    """
+    try:
+        for entry in font.gpos_lookups:
+            if "'kern'" in entry:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# --------------------------------------------------------------------------
+# the transform (fontforge)
+# --------------------------------------------------------------------------
+
+def _scale_metrics(font, factor: float) -> tuple[list[str], list[str]]:
+    """Scale every vertical metric by `factor`. Returns (scaled, failed).
+
+    FontForge's binding requires an int here -- assigning a float raises
+    ``TypeError: 'float' object cannot be interpreted as an integer`` --
+    so every value is rounded. ``failed`` is reported rather than
+    swallowed: a metric that silently does not move leaves a font whose
+    outlines are 5% taller inside an unchanged line box, which shows up
+    as clipped descenders.
+
+    fontforge exposes all 13 of these as writable ints on this build
+    (probe-confirmed): no post-write pass with fontTools is needed.
+    """
+    scaled, failed = [], []
+    for name in (
+        "ascent", "descent",
+        "hhea_ascent", "hhea_descent", "hhea_linegap",
+        "os2_typoascent", "os2_typodescent", "os2_typolinegap",
+        "os2_winascent", "os2_windescent",
+        "os2_capheight", "os2_xheight",
+    ):
+        old = getattr(font, name, None)
+        if not isinstance(old, (int, float)):
+            continue
+        new = round(old * factor)
+        if new == round(old):
+            continue
+        try:
+            setattr(font, name, new)
+            scaled.append(name)
+        except Exception as exc:
+            failed.append(f"{name} ({type(exc).__name__})")
+            log.debug(f"  could not scale {name}: {type(exc).__name__}: {exc}")
+    return scaled, failed
+
+
+def _transform_glyphs(font, sx: float, sy: float) -> None:
+    """Scale every glyph's outline and advance width.
+
+    Per-glyph rather than font-level: a font-level ``font.transform``
+    was observed to leave both advance widths AND GPOS PairPos
+    unchanged on AdwaitaSans (1881 composites), while per-glyph
+    transform scales the advance correctly. Composite references
+    survive intact -- fontforge unrolls them at render time.
+    """
+    for glyph in font.glyphs():
+        glyph.transform((sx, 0.0, 0.0, sy, 0.0, 0.0))
+
+
+# FontForge's overlap/spline diagnostics are written by C code straight to
+# file descriptor 2, bypassing Python's logging entirely -- the existing
+# logging.getLogger("fontforge") suppression in main() cannot touch them.
+# Measured on Noto Sans: an 18-face TTF run emitted 182,299 such lines
+# (~10k per font); the identical transform on CFF input emitted 27.
+#
+# Why this matters beyond noise: that flood goes to the terminal. When it
+# outruns the terminal emulator, or when stderr is a pipe whose 64 KB buffer
+# fills, the C writer BLOCKS on backpressure and the run looks hung. The
+# script's own log goes to sys.stdout (see basicConfig in main), so quenching
+# fd 2 hides none of it. --verbose restores the flood for debugging.
+_QUIET_C_STDERR = True
+
+
+@contextmanager
+def _quench_c_stderr():
+    """Point the process's fd 2 at /dev/null for the duration of the block."""
+    if not _QUIET_C_STDERR:
+        yield
+        return
+    saved = os.dup(2)
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, 2)
+        finally:
+            os.close(null)
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+
+
+def _cleanup(font) -> int:
+    """Per-glyph topology cleanup. Returns glyphs touched.
+
+    v2.1: the per-block _quench_c_stderr() was removed. The outer
+    apply_transform() now wraps the whole per-face body, so the dup2
+    dance would be redundant. _quench_c_stderr() itself is still defined
+    below in case anyone imports it.
+    """
+    touched = 0
+    for glyph in font.glyphs():
+        try:
+            glyph.removeOverlap()
+            glyph.correctDirection()
+            glyph.round()
+            touched += 1
+        except Exception as exc:
+            log.debug(f"  {glyph.glyphname}: {type(exc).__name__}: {exc}")
+    return touched
+
+
+def _add_spacing(font, pct: float) -> int:
+    """Increase advance widths (letter-spacing) by ``pct`` percent.
+
+    We grow the advance via ``glyph.width`` ONLY. This is deliberate and
+    verified: FontForge's ``right_side_bearing`` and ``width`` movers move
+    only the advance edge, never the outline -- but the
+    ``left_side_bearing`` setter physically SHIFTS the outline (verified
+    on Jano 'o': lsb 44->60 moved xMin 44->60 and xMax 536->552, i.e. the
+    whole glyph slid right). So splitting across both bearings would drag
+    every glyph sideways, which is wrong for letter-spacing.
+
+    Growing width alone: the outline stays in place and the extra space
+    sits entirely in the right side bearing. Visually identical to a
+    symmetric split (the outline doesn't move either way), and it keeps
+    every outline exactly where it was. Returns glyphs touched.
+
+    Zero-width glyphs (combining marks) are skipped, since spacing them
+    would pin an advance onto a mark meant to over-strike its base.
+    """
+    if pct == 0.0:
+        return 0
+    per = pct / 100.0
+    touched = 0
+    for glyph in font.glyphs():
+        try:
+            w = glyph.width
+            if w == 0:
+                continue
+            delta = int(round(w * per)) if pct >= 0 else -int(round(abs(w * per)))
+            if delta == 0:
+                continue
+            glyph.width = w + delta
+            touched += 1
+        except Exception as exc:
+            log.debug(f"  {glyph.glyphname}: spacing failed: "
+                      f"{type(exc).__name__}: {exc}")
+    return touched
+
+
+def _quantize_curve(font, n_units: int) -> int:
+    """Snap every curve point to a 1/n_units-unit grid. Returns points touched.
+
+    fontforge.round() snaps to whole font units (1/N grid with N=1). For
+    finer control we write the point coords directly (verified writable
+    on this build). Composites report empty ``foreground`` -- their
+    component outlines live in the referenced glyphs, which are snapped
+    on their own pass, so nothing is double-processed.
+
+    n_units=1 is exactly fontforge.round(). n_units=2 is a half-unit
+    grid, n_units=4 a quarter-unit grid, etc. Verified on JanoSansPro
+    'o': sub-unit coords (66.7, 143.3, 200.7) snap cleanly.
+    """
+    if n_units < 1:
+        raise ValueError(f"--quantize-curve must be >= 1, got {n_units}")
+    grid = 1.0 / n_units
+    touched = 0
+    for glyph in font.glyphs():
+        for contour in glyph.foreground:
+            for pt in contour:
+                nx = round(pt.x * n_units) / n_units
+                ny = round(pt.y * n_units) / n_units
+                if nx != pt.x or ny != pt.y:
+                    pt.x = nx
+                    pt.y = ny
+                    touched += 1
+    return touched
+
+
+_TYPE2_RANGE_RE = re.compile(
+    r"Number out of range:\s*(-?[\d.eE+]+)\s*in type2 output"
+    r"(?:\s*\(must be \[-?\d+, ?-?\d+\]\))?")
+
+
+def _generate_capturing_c_stderr(font, dst: str) -> list[str]:
+    """Write the font, keeping the C writer's diagnostics instead of /dev/null.
+
+    _quench_c_stderr() deliberately sends fd 2 to /dev/null, which is right
+    for the per-glyph noise but hides a real failure here. On CFF output,
+    changeWeight can drive coordinates far outside the type2 range; the
+    writer reports it and then writes the file anyway.
+
+    Measured on NotoSans-ExtraLight (4503 glyphs, CFF in and CFF out):
+        thickness  2,  5 -> no range errors
+        thickness 10 -> "Number out of range: -6.68943e+13 in type2 output"
+        thickness 20 -> -2.67577e+14
+        thickness 40 -> -5.35154e+14
+    The magnitude scales linearly with thickness, so this is divergence in
+    changeWeight rather than a limit being brushed against. The written
+    file stays readable (max coordinate 2802 against a source 2800) and
+    the intended emboldening does land (H: +10.2% area at thickness 10,
+    +40.7% at 40), so the affected geometry is recovered -- but until now
+    the run returned rc=0 and reported success with the diagnostic thrown
+    away.
+
+    Returns the distinct messages, at most MAX_REPORTED.
+    """
+    max_reported = 3
+    saved = os.dup(2)
+    tmp = tempfile.TemporaryFile(mode="w+b")
+    try:
+        os.dup2(tmp.fileno(), 2)
+        font.generate(dst)
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        tmp.seek(0)
+        try:
+            text = tmp.read().decode("utf-8", "replace")
+        finally:
+            tmp.close()
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        m = _TYPE2_RANGE_RE.search(line)
+        if not m:
+            continue
+        msg = m.group(0).strip()
+        if msg in seen:
+            continue
+        seen.add(msg)
+        found.append(f"{msg} ({m.group(1)})")
+        if len(found) >= max_reported:
+            break
+    return found
+
+
+def apply_transform(src: Path, dst: Path, width_pct: float, height_pct: float,
+                  thickness_pct: float, ref_stem: Optional[float],
+                  quantize_units: int = 0, spacing_pct: float = 0.0) -> dict:
+    """Apply the three transforms and write `dst`. Returns a report dict."""
+    # v2.1: single quench wrapping the whole per-face body, instead of
+    # the v2.0 per-block quenches that left _transform_glyphs,
+    # _scale_metrics, _quantize_curve, _add_spacing, font.open, and
+    # font.close OUTSIDE the suppression. See the module docstring.
+    if _QUIET_C_STDERR:
+        _saved_stderr_fd = os.dup(2)
+        _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull_fd, 2)
+        os.close(_devnull_fd)
+        try:
+            return _apply_transform_inner(
+                src, dst, width_pct, height_pct, thickness_pct,
+                ref_stem, quantize_units, spacing_pct)
+        finally:
+            os.dup2(_saved_stderr_fd, 2)
+            os.close(_saved_stderr_fd)
+    return _apply_transform_inner(
+        src, dst, width_pct, height_pct, thickness_pct,
+        ref_stem, quantize_units, spacing_pct)
+
+
+def _apply_transform_inner(src: Path, dst: Path, width_pct: float,
+                           height_pct: float, thickness_pct: float,
+                           ref_stem: Optional[float],
+                           quantize_units: int = 0,
+                           spacing_pct: float = 0.0) -> dict:
+    """Per-face body, called either inside or outside the v2.1 quench."""
+    font = fontforge.open(str(src))
+    report: dict = {"src": src.name}
+    try:
+        sx = 1.0 + width_pct / 100.0
+        sy = 1.0 + height_pct / 100.0
+        if sx <= 0 or sy <= 0:
+            raise ValueError(
+                f"scale would invert the font "
+                f"(width {width_pct}%, height {height_pct}%)")
+
+        if sx != 1.0 or sy != 1.0:
+            _transform_glyphs(font, sx, sy)
+            if sy != 1.0:
+                scaled, failed = _scale_metrics(font, sy)
+                report["metrics_scaled"] = scaled
+                report["metrics_failed"] = failed
+            report["scale_xy"] = (round(sx, 6), round(sy, 6))
+
+        # Topology cleanup, positioned around changeWeight deliberately.
+        #
+        # changeWeight() produces outlines that FontForge 20251009's own
+        # topology ops SIGSEGV on -- a real crash inside libfontforge
+        # (SplineSetsCorrect <- FindEdgesSplineSet), not an exception, so no
+        # try/except can catch it. Measured on the six Noto Sans faces that
+        # died in a real 18-face run, each mode in its own process:
+        #
+        #   cw -> ro -> cd -> round   2/6 survive   (the old order)
+        #   cw -> cd -> round         0/6
+        #   ro -> cw -> cd -> round   0/6
+        #   cw only                   6/6
+        #   ro -> cd -> round -> cw   6/6           (this order)
+        #
+        # So nothing per-glyph may run after thickening. Cleanup happens
+        # here instead, on outlines that have not been thickened yet.
+        #
+        # Why this showed up as a HANG rather than a crash: with --jobs > 1
+        # the fonts go through a fork Pool, and imap_unordered blocks
+        # forever on a worker that died. Observed: rc=124 at 420s, 12/18
+        # outputs, zero stderr -- six faces silently never returned.
+        if thickness_pct != 0.0:
+            report["cleaned"] = _cleanup(font)
+            if not ref_stem:
+                log.warning(f"  {src.name}: no stem measurement, "
+                            f"skipping --thickness")
+            else:
+                # ref_stem was measured on the input. A width scale has
+                # already narrowed the stems, so the target is the
+                # scaled value -- "5% heavier than the shape we are
+                # producing", not "5% of the original".
+                effective = ref_stem * sx
+                delta = abs(thickness_pct) / 100.0 * effective
+                sign = 1.0 if thickness_pct > 0 else -1.0
+                applied = 0
+                # v2.1: inner quench removed; the outer apply_transform()
+                # wrap already routes fd 2 to /dev/null for the whole
+                # per-face body. See the module docstring.
+                for glyph in font.glyphs():
+                    try:
+                        glyph.changeWeight(sign * delta)
+                        applied += 1
+                    except Exception as exc:
+                        log.debug(
+                            f"  {glyph.glyphname}: changeWeight failed: "
+                            f"{type(exc).__name__}: {exc}")
+                report["thickness"] = {
+                    "ref_stem_input": round(ref_stem, 2),
+                    "ref_stem_effective": round(effective, 2),
+                    "delta_units": round(sign * delta, 3),
+                    "glyphs": applied,
+                }
+
+        if quantize_units:
+            touched = _quantize_curve(font, quantize_units)
+            report["quantize_curve"] = {
+                "grid": f"1/{quantize_units}u",
+                "points": touched,
+            }
+
+        # Spacing last, so it operates on the final advance widths after
+        # width/height scaling. It only grows the advance edge, never the
+        # outline, so it composes cleanly with the other transforms.
+        if spacing_pct:
+            report["spacing"] = {
+                "pct": spacing_pct,
+                "glyphs": _add_spacing(font, spacing_pct),
+            }
+
+        # Cleanup for the non-thickening path. When thickness_pct != 0 this
+        # already ran, before changeWeight -- see the note above.
+        if thickness_pct == 0.0 and (sx != 1.0 or sy != 1.0
+                                     or quantize_units or spacing_pct):
+            report["cleaned"] = _cleanup(font)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        type2_errors = _generate_capturing_c_stderr(font, str(dst))
+        if type2_errors:
+            report["type2_errors"] = type2_errors
+    finally:
+        font.close()
+    return report
+
+
+# --------------------------------------------------------------------------
+# verification (re-open the written file in fontforge alone)
+# --------------------------------------------------------------------------
+
+def verify(src: Path, dst: Path, width_pct: float, height_pct: float,
+           thickness_pct: float, expected_stem: Optional[float]) -> dict:
+    """Re-measure the written font and compare against what was asked.
+
+    Expected stem is computed through the whole pipeline: width scaling
+    narrows a stem by the same factor it narrows the letter, and
+    thickness then moves it by its own percentage of that. Comparing a
+    ``--width -10`` run against the input stem would report the correct
+    -10% as an error, so the baseline has to account for it.
+    """
+    out: dict = {}
+    try:
+        s_in = fontforge.open(str(src))
+        stem_in = _measure_stem(s_in)
+        s_in.close()
+        d_in = fontforge.open(str(dst))
+        stem_out = _measure_stem(d_in)
+        d_in.close()
+    except Exception as exc:
+        out["stem_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    out["stem_in"] = round(stem_in, 2) if stem_in else None
+    out["stem_out"] = round(stem_out, 2) if stem_out else None
+    if stem_in and stem_out:
+        out["stem_pct_vs_input"] = round((stem_out - stem_in) / stem_in * 100, 2)
+    if expected_stem and stem_out:
+        out["stem_pct_vs_expected"] = round(
+            (stem_out - expected_stem) / expected_stem * 100, 2)
+    return out
+
+
+# --------------------------------------------------------------------------
+# driver
+# --------------------------------------------------------------------------
+
+def process_font(job) -> tuple[str, bool, list[str]]:
+    """One font end to end. Module level so multiprocessing can pickle it."""
+    (src, dst, width_pct, height_pct, thickness_pct, quantize_units,
+     hint_tool, spacing_pct) = job
+    src, dst = Path(src), Path(dst)
+    lines: list[str] = []
+    try:
+        s = fontforge.open(str(src))
+        try:
+            cap = _measure_cap_height(s)
+            stem = _measure_stem(s)
+            has_gpos = _has_gpos_kern(s)
+        finally:
+            s.close()
+
+        if cap and stem:
+            lines.append(f"  measured from outlines: cap={cap:.1f}u "
+                         f"stem={stem:.1f}u")
+        elif cap:
+            lines.append(f"  measured cap={cap:.1f}u, stem: not enough candidates")
+        else:
+            lines.append("  measurement unavailable")
+
+        if thickness_pct != 0.0 and stem is None:
+            lines.append("  SKIPPED thickness: no stem measured")
+            return src.name, False, lines
+
+        if width_pct != 0.0 and has_gpos:
+            lines.append("  WARNING font has GPOS kerning; --width will "
+                         "scale advance widths but not PairPos XAdvance "
+                         "(letterfit may drift).")
+
+        sx = 1.0 + width_pct / 100.0
+        rep = apply_transform(src, dst, width_pct, height_pct,
+                              thickness_pct, stem, quantize_units,
+                              spacing_pct)
+        for k, v in rep.items():
+            if k == "thickness":
+                lines.append(
+                    f"  thickness: {v['ref_stem_input']}u -> "
+                    f"{v['ref_stem_effective']}u effective, "
+                    f"delta {v['delta_units']:+}u on {v['glyphs']} glyphs")
+            elif k == "metrics_scaled":
+                lines.append(f"  metrics scaled x{1.0 + height_pct/100.0:.4f}: "
+                             f"{', '.join(v) if v else '(none)'}")
+            elif k == "scale_xy":
+                lines.append(f"  scale x={v[0]:.4f} y={v[1]:.4f}")
+            elif k == "quantize_curve":
+                lines.append(f"  quantized curve to {v['grid']} grid: "
+                             f"{v['points']} points snapped")
+            elif k == "spacing":
+                lines.append(f"  spacing {v['pct']:+g}% on {v['glyphs']} glyphs")
+
+        # The type2 writer reporting coordinates outside its own range is a
+        # real failure, not the per-glyph noise _quench_c_stderr hides. The
+        # file still gets written and still renders, so nothing else in this
+        # script would catch it -- without this the run reported success.
+        type2_errors = rep.get("type2_errors") or []
+        if type2_errors:
+            lines.append(f"  FAIL {len(type2_errors)} type2 range error(s) "
+                         f"during CFF generation:")
+            for msg in type2_errors:
+                lines.append(f"    {msg}")
+            lines.append("  the written file may contain repaired geometry; "
+                         "lower --thickness or inspect the affected glyphs")
+
+        # Expected stem through the whole pipeline: width narrows it by
+        # sx, thickness then moves it by its own percentage of that.
+        expected = (stem * sx * (1.0 + thickness_pct / 100.0)) if stem else None
+        v = verify(src, dst, width_pct, height_pct, thickness_pct, expected)
+        if "stem_pct_vs_expected" in v:
+            got = v["stem_pct_vs_expected"]
+            tol = max(2.0, abs(thickness_pct) * 0.25)
+            verdict = "ok" if abs(got) <= tol else "OFF TARGET"
+            lines.append(
+                f"  verify: stem {v['stem_in']}u -> {v['stem_out']}u "
+                f"({v['stem_pct_vs_input']:+.2f}% vs input, "
+                f"{got:+.2f}% vs expected {expected:.1f}u) {verdict}")
+        if v.get("stem_error"):
+            lines.append(f"  verify failed: {v['stem_error']}")
+
+        for name in rep.get("metrics_failed", []):
+            lines.append(f"  WARNING metric not scaled: {name}")
+
+        # Hinting is deliberately the LAST step, after geometry and
+        # verification, so it never perturbs the stem/width checks and
+        # the hints match the final outlines. Failure here is a warning,
+        # not a reason to fail the whole font.
+        if hint_tool:
+            if _hint_file(Path(dst), hint_tool):
+                lines.append(f"  hinted with {hint_tool}")
+            else:
+                lines.append(f"  WARNING hinting skipped ({hint_tool})")
+        # A type2 range error during CFF generation is the one condition here
+        # that produced a plausible-looking output file while the writer had
+        # already reported out-of-range coordinates. Reporting success here
+        # is what let it go unnoticed, so fail the font instead.
+        return src.name, not type2_errors, lines
+    except Exception as exc:
+        lines.append(f"  FAILED {type(exc).__name__}: {exc}")
+        return src.name, False, lines
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="otf_optimize-ff-v2.0",
+        description="Scale font width, height and stem thickness via FontForge.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  # 5% heavier stems, 12 fonts at once
+  otf_optimize-ff-v2.0.py --thickness 5 -j 12 IN OUT
+
+  # 8% narrower, 4% taller
+  otf_optimize-ff-v2.0.py --width -8 --height 4 IN OUT
+
+  # snap every outline point to integer units (geometry cleanup)
+  otf_optimize-ff-v2.0.py --quantize-curve 1 IN OUT
+
+  # autohint the output (last step): cff -> otfautohint, tt -> ttfautohint
+  otf_optimize-ff-v2.0.py --thickness 5 --hint auto IN OUT
+
+  # +6% letter-spacing (advance widths only; outlines never move)
+  otf_optimize-ff-v2.0.py --spacing 6 IN OUT
+
+percentages are signed and relative to the measured stem width, not a
+fixed number of font units.
+
+NOTE: --width scales advance widths but NOT GPOS PairPos XAdvance.
+On fonts with GPOS kerning (most modern OTF/TTF) expect letterfit drift;
+the script warns at the top of any affected run.
+
+NOTE: fontforge.autoHint() emits NO hint bytecode on the 20251009 build
+(verified: 0/2938 TrueType glyphs with program, 0/1568 CFF charstrings
+with hintmask). There is no hinting path here -- curve/stem quantizing
+and geometry cleanup only.
+""")
+    p.add_argument("input_dir", type=Path)
+    p.add_argument("output_dir", type=Path)
+
+    p.add_argument("--width", type=float, default=0.0, metavar="PCT",
+                   help="Scale glyphs horizontally. -10 = 10%% narrower. "
+                        "Does NOT rescale GPOS PairPos XAdvance.")
+    p.add_argument("--height", type=float, default=0.0, metavar="PCT",
+                   help="Scale glyphs vertically and rescale ascent, descent, "
+                        "hhea and OS/2 vertical metrics. 5 = 5%% taller.")
+    p.add_argument("--thickness", type=float, default=0.0, metavar="PCT",
+                   help="Scale stem weight by this percentage of the MEASURED "
+                        "stem width. Negative thins. Uses changeWeight, so "
+                        "joins and counters stay clean.")
+    p.add_argument("--spacing", type=float, default=0.0, metavar="PCT",
+                   help="Increase advance widths (letter-spacing) by this "
+                        "percent. 5 = 5%% more space between glyphs; negative "
+                        "tightens. Grows the advance edge only -- outlines never "
+                        "move (FontForge's lsb setter shifts the outline, so "
+                        "spacing is done via width alone). Zero-width glyphs "
+                        "(combining marks) are skipped.")
+    p.add_argument("--quantize-curve", type=int, default=0, metavar="N",
+                   help="Snap every outline point to a 1/N-unit grid. N=1 is "
+                        "fontforge.round() (integer units); N=2 a half-unit "
+                        "grid, N=4 a quarter-unit grid. Reduces geometry "
+                        "noise but can deform thin features; default off.")
+    p.add_argument("--hint", choices=["auto", "none", "cff", "tt"],
+                   default="none", metavar="MODE",
+                   help="Autohint the OUTPUT as the last step (after geometry,"
+                        " so hints match final outlines). auto picks the backend"
+                        " from output format. cff -> otfautohint (AFDKO), "
+                        "tt -> ttfautohint. FontForge's own autoHint emits no "
+                        "bytecode on 20251009, so this runs an external binary."
+                        " Default: none (no hinting).")
+    p.add_argument("--jobs", "-j", type=int, default=0, metavar="N",
+                   help="Process N fonts in parallel. 0 = auto (one worker "
+                        "per CPU, capped at the font count). 1 = sequential.")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    global _QUIET_C_STDERR
+    _QUIET_C_STDERR = not args.verbose
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s - %(message)s", stream=sys.stdout)
+    # fontforge prints 'Internal Error (overlap)' for noisy ligatures
+    # even on success; silence its root logger unless --verbose.
+    logging.getLogger("fontforge").setLevel(logging.ERROR if not args.verbose else logging.DEBUG)
+
+    if not args.input_dir.is_dir():
+        log.error(f"input directory not found: {args.input_dir}")
+        return 2
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    fonts = sorted(q for q in args.input_dir.iterdir()
+                   if q.suffix.lower() in SUPPORTED_EXTENSIONS)
+    if not fonts:
+        log.error(f"no .otf/.ttf files in {args.input_dir}")
+        return 1
+
+    jobs = [(str(q), str(args.output_dir / q.name),
+             args.width, args.height, args.thickness,
+             args.quantize_curve,
+             _resolve_hint_tool(args.hint, q.suffix.lower()),
+             args.spacing) for q in fonts]
+
+    cpu = os.cpu_count() or 1
+    workers = min(args.jobs, len(jobs)) if args.jobs > 0 else min(cpu, len(jobs))
+
+    log.info(f"{len(fonts)} font(s)  width={args.width:+g}%  "
+             f"height={args.height:+g}%  thickness={args.thickness:+g}%  "
+             f"spacing={args.spacing:+g}%")
+    if args.quantize_curve:
+        log.info(f"  curve quantize: 1/{args.quantize_curve}-unit grid")
+    if args.hint in ("auto", "cff", "tt"):
+        log.info(f"  hinting: {args.hint}")
+    if all(v == 0 for v in (args.width, args.height, args.thickness, args.spacing)) \
+            and not args.quantize_curve:
+        log.warning("all transforms are 0 and no quantize -- this is a no-op copy")
+    log.info(f"workers: {workers} ({cpu} CPUs)")
+
+    # Cross-font GPOS scan once. fontforge's binding reads kern lookups
+    # cheaply; doing it per-font would repeat work.
+    if args.width != 0.0:
+        any_gpos = False
+        for q in fonts:
+            try:
+                f = fontforge.open(str(q))
+                if _has_gpos_kern(f):
+                    any_gpos = True
+                    f.close()
+                    break
+                f.close()
+            except Exception:
+                continue
+        if any_gpos:
+            log.warning("at least one input font carries GPOS PairPos kerning; "
+                        "--width will scale advance widths but NOT PairPos "
+                        "XAdvance. letterfit may drift on those fonts.")
+
+    ok = 0
+    if workers > 1:
+        import multiprocessing as mp
+        ctx = mp.get_context("fork")
+        # A worker can die from a C-level crash inside libfontforge, which no
+        # try/except in this script can catch. Observed on FontForge
+        # 20251009: Noto Sans ExtraLight SIGSEGVs during CFF generation
+        # because changeWeight drives one combining mark (hacombcy) to
+        # coordinates ~2.9e12, outside the type2 writer's [-65536, 65535].
+        #
+        # pool.imap_unordered blocks forever on a task whose worker died --
+        # the result is simply never delivered -- so that crash presented as
+        # an infinite HANG: measured rc=124 at 420s with 12/18 outputs and
+        # zero stderr. apply_async with a bounded get() converts it into a
+        # reported failure, and the remaining fonts still complete.
+        # Overridable so a pathological font can be triaged quickly instead
+        # of burning the full budget.
+        PER_FONT_TIMEOUT = int(os.environ.get("OTF_PER_FONT_TIMEOUT", "600"))
+        with ctx.Pool(processes=workers) as pool:
+            pending = [(Path(job[0]).name,
+                        pool.apply_async(process_font, (job,)))
+                       for job in jobs]
+            for name, res in pending:
+                try:
+                    rname, good, lines = res.get(timeout=PER_FONT_TIMEOUT)
+                except mp.TimeoutError:
+                    log.error(f"FAIL {name}: no result within "
+                              f"{PER_FONT_TIMEOUT}s -- worker most likely "
+                              f"crashed inside libfontforge (see stderr "
+                              f"'Number out of range' / 'Stack got too big')")
+                    continue
+                log.info(f"{'ok  ' if good else 'FAIL'} {rname}")
+                for ln in lines:
+                    log.info(ln)
+                ok += good
+    else:
+        for job in jobs:
+            name, good, lines = process_font(job)
+            log.info(f"{'ok  ' if good else 'FAIL'} {name}")
+            for ln in lines:
+                log.info(ln)
+            ok += good
+
+    log.info(f"done: {ok}/{len(fonts)} succeeded -> {args.output_dir}")
+    return 0 if ok == len(fonts) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
