@@ -173,17 +173,49 @@ def _point_in_polygon(pt, poly):
 
 
 def _reverse_contour(ops):
-    """Return one contour traversed the other way round."""
-    segs = [op for op in ops if op[0] in ('lineTo', 'curveTo')]
-    if not segs:
+    """Return one contour traversed the other way round.
+
+    Two things this must get right, and the previous version got both wrong:
+
+      * A reversed cubic must END at the point the original segment STARTED
+        from. The old code emitted curveTo(p3, c2, c1): it used the original
+        endpoint as the first control point and finished on a control point,
+        so the reversed contour was NOT the same shape with the opposite
+        sense. Counters (holes) came out smaller, which reads as "bolder".
+      * closePath must survive the reversal. The old code dropped it, so a
+        3-point contour (a triangle) came back as a 2-point degenerate
+        contour and the glyph lost half its height.
+
+    The ops carry absolute coordinates, so each segment's start point is the
+    previous segment's endpoint and no separate bookkeeping is needed.
+    """
+    start = None
+    segs = []
+    has_close = False
+    for op, args in ops:
+        if op == 'moveTo':
+            start = args[0]
+        elif op == 'lineTo':
+            segs.append(('line', None, None, args[0]))
+        elif op == 'curveTo':
+            segs.append(('curve', args[0], args[1], args[2]))
+        elif op == 'closePath':
+            has_close = True
+    if start is None or not segs:
         return list(ops)
-    end = segs[-1][1][-1]
-    out = [('moveTo', (end,))]
-    for op in reversed(segs):
-        if op[0] == 'lineTo':
-            out.append(('lineTo', (op[1][0],)))
+    # starts[i] is the point segment i began at.
+    starts = [start] + [s[3] for s in segs[:-1]]
+    out = [('moveTo', (segs[-1][3],))]
+    for i in range(len(segs) - 1, -1, -1):
+        kind, c1, c2, _end = segs[i]
+        prev = starts[i]
+        if kind == 'line':
+            out.append(('lineTo', (prev,)))
         else:
-            out.append(('curveTo', (op[1][2], op[1][1], op[1][0])))
+            # Reversed cubic: P3 -> P0 with controls c2 then c1.
+            out.append(('curveTo', (c2, c1, prev)))
+    if has_close:
+        out.append(('closePath', ()))
     return out
 
 

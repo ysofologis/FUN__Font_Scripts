@@ -965,10 +965,12 @@ class FringeKiller:
             font.selection.all()
             font.removeOverlap()
             font.round()
-            # Scale advance widths by the same factor so glyph spacing is preserved
-            for glyph in font.glyphs():
-                if glyph.width > 0:
-                    glyph.width = int(round(glyph.width * factor_x))
+            # FontForge's font.transform() ALREADY scales glyph advance
+            # widths by the transform factor (verified: a 1.5x transform
+            # turns a 688-unit advance into 1032). Scaling them a second
+            # time here compounded the factor: --width 100 produced x4
+            # advances, and --scale 1.5 produced a 1.0303 advance ratio
+            # instead of 1.0150. Do not scale them again.
             self.stats['width_applied'] = self.width
             self._log(f"Width adjusted: ×{factor_x:.4f} horizontal", 'sub')
         except Exception as e:
@@ -1011,9 +1013,10 @@ class FringeKiller:
             font.selection.all()
             font.removeOverlap()
             font.round()
-            for glyph in font.glyphs():
-                if glyph.width > 0:
-                    glyph.width = int(round(glyph.width * s))
+            # font.transform() already scales advance widths by the factor
+            # (a 1.015x transform takes a 688-unit advance to 698). Scaling
+            # them again here compounded it: --scale 1.5 gave a 1.0294
+            # advance ratio instead of 1.0150, and --scale 100 gave x4.
             self.stats['scale_applied'] = self.scale
         except Exception as e:
             self._log(f"Scale issue: {e}", 'sub')
