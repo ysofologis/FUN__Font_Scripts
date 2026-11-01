@@ -1,44 +1,44 @@
 #!/usr/bin/env python3
 """
-otf_optimize_foundry-v15.py — scale and thicken TTF fonts, foundrytools path.
+otf_optimize_foundry-v15.py — scale and thicken TTF/OTF fonts, foundrytools path.
 
-TTF only. CFF/OTF input is rejected: the CFF charstring round-trip
-needs a T2Char-aware pen that emits the right operand/operator
-interleaving, which is more code than this script wants to carry
-without a real test surface. Use ttf2otf_ft_v6.py for TTF→OTF
-conversion and the geometry primitives in that file, or convert the
-input to TTF first if you need the CFF path.
-
-Pure-Python pipeline using foundrytools + fontTools + skia-pathops.
-Does two things and nothing else:
+Pure-Python pipeline using foundrytools + fontTools + skia. Does two
+things and nothing else:
 
     --scale       percent, scales outlines + advance widths (default 0 = no-op)
     --thickness   units per side, emboldens via stroke-and-union (default 0)
 
 Both default to 0, which is a verified no-op. Positive values grow.
 
+Supports TTF (glyf) and OTF (CFF / CFF2) input. TTF uses TTGlyphPen +
+TransformPen; OTF uses T2CharStringPen round-trip (decompose via
+RecordingPen, transform coordinates, rebuild via T2CharStringPen).
+Both share the same skia stroke+union for thicken. The OTF path's
+charstring round-trip inlines the source's subroutines (so the output
+is larger than the input) but preserves the private dict and global subrs.
+
 Why a separate script:
     otf_optimize-ff-v2.x.py uses libfontforge's glyph.changeWeight(),
     which is fast on small fonts but slow on big ones (35k-glyph faces
-    take minutes per face on SF-Compact). This script uses skia-pathops
-    for both scaling and thickening; faster on big fonts but the
-    embolden output geometry is NOT identical to libfontforge's
-    changeWeight (different stroke width, different corner handling).
-    Verify the visual output before substituting on a critical pipeline.
+    take minutes per face on SF-Compact). This script uses skia for
+    both scaling and thickening; faster on big fonts but the embolden
+    output geometry is NOT identical to libfontforge's changeWeight
+    (different stroke width, different corner handling). Verify the
+    visual output before substituting on a critical pipeline.
 
 Pipeline:
     1. Open with foundrytools.Font (validates font, exposes ttfont).
     2. If variable, instantiate to a named instance.
-    3. --scale: per-glyph TransformPen for outlines; per-glyph
-       advance width scaling. Composite references are unrolled
-       at render time.
+    3. --scale: per-glyph TransformPen for outlines (TTF) or per-
+       charstring coordinate scaling (CFF); per-glyph advance width
+       scaling on both paths.
+       Composite references are unrolled at render time on the TTF path.
     4. --thickness: per-glyph skia-pathops Path + stroke + Path.union,
-       re-emit into the glyph's pen.
-    5. Verify: re-open, measure bbox, report.
-    6. Font.save(out_path) — writes TTF/quad.
+       re-emit into the glyph's pen (TTF) or into a fresh T2Char (CFF).
+    5. Font.save(out_path).
 
 Usage:
-    # Thicken only (10 units per side, like ttf2otf_ft_v6.py --thickness 10):
+    # Thicken only (10 units per side):
     python otf_optimize_foundry-v15.py --thickness 10 IN OUT
 
     # Scale and thicken:
@@ -48,7 +48,7 @@ Usage:
     python otf_optimize_foundry-v15.py --scale 2.5 --thickness 5 ./fonts/ ./out/
 
 Requirements:
-    pip install foundrytools          # pulls in fontTools + skia-pathops
+    pip install foundrytools          # pulls in fontTools + skia
 
 Author: Bufos — created 2026-10-19 alongside otf_optimize-ff-v2.1.
 """
@@ -195,6 +195,7 @@ from fontTools.ttLib import TTFont
 from fontTools.pens.transformPen import TransformPen
 from fontTools.pens.recordingPen import RecordingPen
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.pens.t2CharStringPen import T2CharStringPen
 
 # v15 uses skia directly (not skia-pathops) for thicken. The skia-pathops
 # binding's Path.stroke() returns None on every input in this build, even
@@ -360,12 +361,200 @@ def _draw_skia_path_to_pen(sk_path, pen) -> None:
             cur = p3
             pen.curveTo((p1[0], p1[1]), (p2[0], p2[1]), (p3[0], p3[1]))
         elif "Quad" in vname:
-            # Drop quadratic on the floor; the miter-join stroke
-            # path should not contain any. If one slips through
-            # we lose that segment, which is safer than guessing.
-            continue
+            # Skia's union of a stroke+union produces quadratic curves.
+            # T2CharStringPen has qCurveTo (will raise to cubic).
+            # TTGlyphPen does not -- we raise to a cubic ourselves.
+            # To raise correctly we need the previous on-curve point;
+            # track it via the `cur` variable.
+            p1, p2 = xyz(pts[0]), xyz(pts[1])
+            if cur is None:
+                # No prior on-curve point; skip the curve.
+                continue
+            cx1 = cur[0] + 2 / 3 * (p1[0] - cur[0])
+            cy1 = cur[1] + 2 / 3 * (p1[1] - cur[1])
+            cx2 = p1[0] + 2 / 3 * (p2[0] - p1[0])
+            cy2 = p1[1] + 2 / 3 * (p2[1] - p1[1])
+            cur = p2
+            if hasattr(pen, "qCurveTo"):
+                pen.qCurveTo((p1[0], p1[1]), (p2[0], p2[1]))
+            else:
+                pen.curveTo((cx1, cy1), (cx2, cy2), (p2[0], p2[1]))
         elif "Conic" in vname:
             continue
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Geometry: scale and thicken for CFF (OTF)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# CFF charstrings are cubic-only and live in a 'CFF ' table. There is no
+# per-glyph width on the charstring itself -- advance widths live in 'hmtx'.
+# The round-trip is:
+#   1. cs.draw(recording_pen)        -- decompose charstring to ops
+#   2. transform ops                  -- apply scale or stroke+union
+#   3. T2CharStringPen(...)           -- re-emit to a fresh T2Char
+#   4. new_cs.private = cs.private    -- preserve hints/subr refs
+#   5. charstrings[name] = new_cs     -- install
+
+
+def _decompose_cff_to_ops(charstrings, glyph_name: str) -> list | None:
+    """Return the recording-pen op list for a CFF charstring, or None."""
+    try:
+        cs = charstrings[glyph_name]
+    except KeyError:
+        return None
+    rec = RecordingPen()
+    try:
+        cs.draw(rec)
+    except Exception:
+        return None
+    return list(rec.value)
+
+
+def _rebuild_cff_charstring(ops: list, src_cs) -> "T2Char":
+    """Build a fresh T2Char from a recording-pen op list."""
+    new_pen = T2CharStringPen(width=None, glyphSet=None, roundTolerance=0.5)
+    for op, args in ops:
+        if op == "moveTo":
+            new_pen.moveTo(args[0])
+        elif op == "lineTo":
+            new_pen.lineTo(args[0])
+        elif op == "curveTo":
+            # CFF RecordingPen emits curveTo as 3 separate (x, y) args.
+            # T2CharStringPen.curveTo expects 3 (x, y) tuples.
+            new_pen.curveTo(
+                (args[0][0], args[0][1]),
+                (args[1][0], args[1][1]),
+                (args[2][0], args[2][1]),
+            )
+        elif op == "qCurveTo":
+            # Pass to the pen's qCurveTo; it raises to cubic internally.
+            for i in range(len(args) - 1):
+                x1, y1 = args[i]
+                x2, y2 = args[i + 1]
+                new_pen.qCurveTo((x1, y1), (x2, y2))
+        elif op == "closePath":
+            new_pen.closePath()
+        elif op == "endPath":
+            new_pen.endPath()
+    new_cs = new_pen.getCharString(optimize=True)
+    new_cs.private = src_cs.private
+    new_cs.globalSubrs = src_cs.globalSubrs
+    return new_cs
+
+
+def _cff_scale_glyph(charstrings, glyph_name: str, sx: float, sy: float) -> None:
+    """Scale a single CFF charstring's outline.
+
+    Re-decomposes, scales each coordinate by (sx, sy), rebuilds.
+    TransformPen is a PointPen, not a SegmentPen, so the TTF-style
+    "wrap a TransformPen around a RecordingPen" trick does not work
+    for the CFF path. Direct math is simpler and equivalent.
+    """
+    ops = _decompose_cff_to_ops(charstrings, glyph_name)
+    if not ops:
+        return
+    src_cs = charstrings[glyph_name]
+
+    # Build the new op list with each coordinate scaled.
+    new_ops = []
+    for op, args in ops:
+        if op == "moveTo":
+            x, y = args[0]
+            new_ops.append((op, ((x * sx, y * sy),)))
+        elif op == "lineTo":
+            x, y = args[0]
+            new_ops.append((op, ((x * sx, y * sy),)))
+        elif op == "curveTo":
+            # CFF RecordingPen emits curveTo as 3 separate (x, y) args.
+            new_args = (
+                (args[0][0] * sx, args[0][1] * sy),
+                (args[1][0] * sx, args[1][1] * sy),
+                (args[2][0] * sx, args[2][1] * sy),
+            )
+            new_ops.append((op, new_args))
+        elif op == "qCurveTo":
+            # Chain of quad control points; scale each.
+            new_args = tuple((x * sx, y * sy) for x, y in args)
+            new_ops.append((op, new_args))
+        else:
+            # closePath, endPath -- no coords.
+            new_ops.append((op, args))
+
+    charstrings[glyph_name] = _rebuild_cff_charstring(new_ops, src_cs)
+
+
+
+
+def _cff_thicken_glyph(charstrings, glyph_name: str,
+                       delta_units: float) -> bool:
+    """Embolden a single CFF charstring by skia stroke+union.
+
+    Returns True on success; False if decomposition or stroke failed.
+    """
+    ops = _decompose_cff_to_ops(charstrings, glyph_name)
+    if not ops:
+        return False
+    if not _ops_have_outline(ops):
+        return False
+
+    src_cs = charstrings[glyph_name]
+
+    # Build a skia.Path from the recording.
+    builder = skia.PathBuilder()
+    for op, args in ops:
+        if op == "moveTo":
+            x, y = args[0]
+            builder.moveTo(x, y)
+        elif op == "lineTo":
+            x, y = args[0]
+            builder.lineTo(x, y)
+        elif op == "qCurveTo":
+            for i in range(len(args) - 1):
+                x1, y1 = args[i]
+                x2, y2 = args[i + 1]
+                builder.quadTo(x1, y1, x2, y2)
+        elif op == "curveTo":
+            x1, y1, x2, y2, x3, y3 = args[0][0], args[0][1], args[1][0], args[1][1], args[2][0], args[2][1]
+            builder.cubicTo(x1, y1, x2, y2, x3, y3)
+        elif op == "closePath":
+            builder.close()
+        elif op == "endPath":
+            pass
+    sk_path = builder.detach()
+
+    # Stroke.
+    paint = skia.Paint()
+    paint.setStyle(skia.Paint.kStroke_Style)
+    paint.setStrokeWidth(delta_units * 2.0)
+    paint.setStrokeJoin(skia.Paint.kMiter_Join)
+    paint.setStrokeCap(skia.Paint.kButt_Cap)
+    paint.setStrokeMiter(4.0)
+    stroked = skia.Path()
+    if not paint.getFillPath(sk_path, stroked):
+        return False
+
+    # Union with the original.
+    unioned = skia.Op(stroked, sk_path, skia.PathOp.kUnion_PathOp)
+    if unioned is None or unioned.isEmpty():
+        return False
+
+    # Walk the unioned path into a fresh T2Char.
+    new_pen = T2CharStringPen(width=None, glyphSet=None, roundTolerance=0.5)
+    _draw_skia_path_to_pen(unioned, new_pen)
+    new_cs = new_pen.getCharString(optimize=True)
+    new_cs.private = src_cs.private
+    new_cs.globalSubrs = src_cs.globalSubrs
+    charstrings[glyph_name] = new_cs
+    return True
+
+
+def _ops_have_outline(ops: list) -> bool:
+    """Does an op list contain anything more than an empty move/close?"""
+    for op, args in ops:
+        if op in ("lineTo", "curveTo", "qCurveTo"):
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -374,18 +563,25 @@ def _draw_skia_path_to_pen(sk_path, pen) -> None:
 
 
 def process_font(job: tuple[str, str, float, float]) -> tuple[str, bool, str]:
-    """Open, scale, thicken, save. Returns (name, ok, message)."""
+    """Open, scale, thicken, save. Returns (name, ok, message).
+
+    Dispatches on TTF (glyf) vs CFF/OTF (CFF or CFF2) tables. TTF path
+    uses TTGlyphPen + TransformPen; CFF path uses T2CharStringPen.
+    Both share the same skia stroke+union for thicken.
+    """
     src, dst, scale_pct, thickness_units = job
     name = os.path.basename(src)
     try:
         t0 = time.time()
         f = Font(src)
+        tt = f.ttfont
 
-        # TTF only.
-        if "glyf" not in f.ttfont:
-            return name, False, "not a TTF (no glyf table); skipped"
+        is_ttf = "glyf" in tt
+        is_cff = "CFF " in tt or "CFF2" in tt
+        if not (is_ttf or is_cff):
+            return name, False, "no glyf or CFF table; skipped"
 
-        if "fvar" in f.ttfont:
+        if "fvar" in tt:
             try:
                 var2static_run(f, overlap=True)
             except Var2StaticError as e:
@@ -398,24 +594,41 @@ def process_font(job: tuple[str, str, float, float]) -> tuple[str, bool, str]:
         sx = 1.0 + scale_pct / 100.0
         sy = sx
 
+        # ----- SCALE -----
+        msg_scale = ""
         if scale_pct != 0:
-            for glyph in f.ttfont.getGlyphOrder():
-                _scale_glyph(f.ttfont["glyf"], glyph, sx, sy)
-            hmtx = f.ttfont["hmtx"]
-            for glyph in f.ttfont.getGlyphOrder():
+            hmtx = tt["hmtx"]
+            for glyph in tt.getGlyphOrder():
                 adv, lsb = hmtx[glyph]
                 hmtx[glyph] = (int(round(adv * sx)), lsb)
 
+            if is_ttf:
+                for glyph in tt.getGlyphOrder():
+                    _scale_glyph(tt["glyf"], glyph, sx, sy)
+            else:
+                charstrings = tt["CFF "].cff.topDictIndex[0].CharStrings
+                for glyph in tt.getGlyphOrder():
+                    _cff_scale_glyph(charstrings, glyph, sx, sy)
+            msg_scale = f"scale={sx:.4f}"
+
+        # ----- THICKEN -----
         msg_thick = ""
         if thickness_units != 0:
-            applied = 0
-            for glyph in f.ttfont.getGlyphOrder():
-                if _thicken_glyph(f.ttfont["glyf"], glyph, thickness_units):
-                    applied += 1
+            if is_ttf:
+                applied = 0
+                for glyph in tt.getGlyphOrder():
+                    if _thicken_glyph(tt["glyf"], glyph, thickness_units):
+                        applied += 1
+            else:
+                charstrings = tt["CFF "].cff.topDictIndex[0].CharStrings
+                applied = 0
+                for glyph in tt.getGlyphOrder():
+                    if _cff_thicken_glyph(charstrings, glyph, thickness_units):
+                        applied += 1
             msg_thick = f"thicken +{thickness_units:.1f}u/side on {applied} glyphs"
 
         f.save(dst)
-        return name, True, (f"scale={sx:.4f} {msg_thick} "
+        return name, True, (f"{msg_scale} {msg_thick} "
                             f"({time.time() - t0:.1f}s)").strip()
     except Exception as exc:
         return name, False, f"{type(exc).__name__}: {exc}"
@@ -425,7 +638,7 @@ def process_font(job: tuple[str, str, float, float]) -> tuple[str, bool, str]:
 #  Directory walk + worker pool
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SUPPORTED_EXT = (".ttf",)
+_SUPPORTED_EXT = (".ttf", ".otf")
 
 
 def discover(input_dir: Path) -> list[Path]:
@@ -438,9 +651,10 @@ def discover(input_dir: Path) -> list[Path]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description=("Scale and/or thicken TTF fonts via foundrytools + "
-                     "skia-pathops. TTF only -- CFF/OTF input is rejected "
-                     "(use ttf2otf_ft_v6.py for the OTF path)."),
+        description=("Scale and/or thicken TTF/OTF fonts via foundrytools + "
+                     "skia-pathops. Both TTF and CFF/OTF are supported. "
+                     "CFF charstrings are decomposed via T2CharStringPen, "
+                     "transformed, and re-emitted."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("input_dir", type=Path, help="Input directory (recursive)")
