@@ -53,6 +53,7 @@ import os
 import sys
 import argparse
 import math
+import re
 import shutil
 import tempfile
 import subprocess
@@ -75,7 +76,39 @@ try:
         resolve_fs_selection as _resolve_fs_selection,
     )
 except ImportError:
-    pass
+    # Fall back to leaving the source metadata alone. The shared module is
+    # the correct implementation; this path only exists so a half-copied
+    # install degrades to "no metadata repair" instead of a hard failure.
+    def _is_italic(*texts):
+        low = " ".join(t for t in texts if t).lower()
+        return "italic" in low or "oblique" in low
+
+    def _is_bold(*texts):
+        return any("bold" in t.lower() or "black" in t.lower()
+                   for t in texts if t)
+
+    def _is_style_word(w):
+        if not w:
+            return False
+        key = re.sub(r"[^a-z]", "", w.lower())
+        return bool(key) and ("bold" in key or "black" in key
+                              or "light" in key or "italic" in key
+                              or "oblique" in key)
+
+    def _style_bits(family, style, ps):
+        return _is_bold(style, ps), _is_italic(style, ps, family)
+
+    def _is_regular_weight(style):
+        return True
+
+    def _weight_class_for(style):
+        return None
+
+    def _resolve_weight_class(src_weight, style):
+        return src_weight
+
+    def _resolve_fs_selection(src_selection, style, resolved_style=None):
+        return src_selection or 0
 
 try:
     import fontforge
