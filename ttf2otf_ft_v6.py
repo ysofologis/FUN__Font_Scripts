@@ -643,6 +643,59 @@ def _style_bits(family, style, ps):
     return _is_bold(style, ps), _is_italic(style, ps, family)
 
 
+# Canonical CSS-style usWeightClass values for a style token. These are the
+# CSS font-weight keywords, which is what fontconfig expects when it scores
+# a face against a requested weight.
+_WEIGHT_TOKENS = {
+    "hairline": 100, "thin": 100, "extrathin": 100, "ultrathin": 100,
+    "extralight": 200, "ultralight": 200,
+    "light": 300, "semilight": 300, "demilight": 300,
+    "book": 400, "regular": 400, "normal": 400, "roman": 400, "text": 400,
+    "medium": 500,
+    "semibold": 600, "demibold": 600,
+    "bold": 700,
+    "extrabold": 800, "ultrabold": 800,
+    "extrablack": 900, "ultrablack": 950,
+    "fat": 800,
+    "black": 900, "heavy": 900,
+}
+
+# Two-word intensities: the prefix is part of the weight name, so it cannot
+# be resolved by looking up the second word alone ("Extra Bold" is 800, not
+# 700; "Ultra Light" is 200, not 300). The key is the joined pair.
+_WEIGHT_COMPOUNDS = {
+    "extrabold": 800, "ultrabold": 800,
+    "semibold": 600, "demibold": 600,
+    "extralight": 200, "ultralight": 200,
+    "semilight": 300, "demilight": 300,
+    "extrathin": 100, "ultrathin": 100,
+    "extrablack": 900, "ultrablack": 950,
+    "superblack": 950, "hyperblack": 950,
+    "extrabook": 400, "ultrabook": 400,
+    "extrabolditalic": 800, "ultrabolditalic": 800,
+    "semibolditalic": 600, "demibolditalic": 600,
+}
+
+def _is_regular_weight(style):
+    """True when a style name denotes the Regular weight of its family.
+
+    'Regular', 'Book' and 'Roman' are the names a family gives its
+    weight-400 cut; 'Thin', 'Light', 'Medium', 'Bold' and 'Black' are not.
+    """
+    if not style:
+        return True
+    tokens = [t.lower() for t in re.split(r"[^A-Za-z]+", style) if t]
+    if not tokens:
+        return True
+    # A style that names any weight other than the regular one is not it.
+    for tok in tokens:
+        if tok in ("italic", "oblique"):
+            continue
+        if tok in _WEIGHT_TOKENS:
+            return _WEIGHT_TOKENS[tok] == 400
+    return True
+
+
 def _fs_selection(font, family, style, ps, resolved_style=None):
     """OS/2.fsSelection, bit 0 italic / bit 5 bold / bit 6 regular.
 
@@ -668,7 +721,15 @@ def _fs_selection(font, family, style, ps, resolved_style=None):
     # Bit 8 (USE_TYPO_METRICS) is unrelated to bold/italic and must survive:
     # dropping it makes a font fall back on hhea/OS/2 win metrics and shifts
     # every line of text. Preserve all non-style bits from the source.
-    passthrough = src & ~0x23
+    #
+    # Bit 6 (REGULAR) must NOT be carried over: it is mutually exclusive with
+    # bit 0 (ITALIC) and bit 5 (BOLD), and the mask below only cleared the
+    # latter two. A source that sets REGULAR on every face (Absolut Pro does
+    # -- all 24 faces ship fsSelection=0x0040) therefore leaked REGULAR onto
+    # faces that this function had just marked BOLD, giving
+    # fsSelection=0x0060 (REGULAR|BOLD) on Absolut Pro Black. That is
+    # self-contradictory and fontconfig reads the REGULAR bit.
+    passthrough = src & ~0x63
     use_src = bool(src & (1 | 32))
     if use_src:
         bold = bool(src & 32)
@@ -678,7 +739,12 @@ def _fs_selection(font, family, style, ps, resolved_style=None):
         val |= 1
     if bold:
         val |= 32
-    if not (val & (1 | 32)):
+    # REGULAR is only claimed by a face that is neither bold nor italic AND
+    # is not a lighter or heavier cut. A "Thin" face is not the Regular of
+    # its family, and claiming REGULAR on every weight of a family leaves
+    # fontconfig with several equally-valid Regular candidates -- which is
+    # how Absolut Pro ended up resolving to AbsolutPro-Black.
+    if not (val & (1 | 32)) and _is_regular_weight(resolved_style or style):
         val |= 64
     return val
 
@@ -713,6 +779,57 @@ def _panose_for(style, ps):
                   bLetterForm=2,
                   bMidline=2 if bold else 3,   # 2=slanted when italic
                   bXHeight=4)
+
+
+def _weight_class_for(style, default=None):
+    """Derive OS/2.usWeightClass from a face's style name.
+
+    The source's own usWeightClass is often wrong: some families ship every
+    face declaring 400 (Absolut Pro does -- all 24 faces), because the
+    foundry never updated the OS/2 table when it added weights. Copying that
+    value through makes every face a Regular candidate, so fontconfig scores
+    them all identically and the tie breaks arbitrarily -- `fc-match "Absolut
+    Pro"` came back with AbsolutPro-Black.
+
+    The style name is the authority in that case. Return None when the style
+    carries no weight word at all, so the caller can keep the source value.
+    """
+    if not style:
+        return None
+    tokens = [t.lower() for t in re.split(r"[^A-Za-z]+", style) if t]
+
+    # The prefix is part of the weight name, so the pair is resolved first:
+    # "Extra Bold" is 800, not 700, and "Ultra Light" is 200, not 300.
+    for i in range(len(tokens) - 1):
+        val = _WEIGHT_COMPOUNDS.get(tokens[i] + tokens[i + 1])
+        if val is not None:
+            return val
+
+    for tok in tokens:
+        val = _WEIGHT_TOKENS.get(tok)
+        if val is not None:
+            return val
+    return None
+
+
+def _resolve_weight_class(src_weight, style):
+    """Pick the OS/2.usWeightClass to write.
+
+    A source weight of 400 is treated as a placeholder rather than a fact:
+    every face of a family that never updated its OS/2 table declares 400,
+    which makes them all Regular candidates in fontconfig. When the style
+    name names a definite non-400 weight, that name wins.
+
+    A source weight that is anything else is taken at face value. Some
+    families use a non-CSS value on purpose (PFBeauSansPro-Thin declares
+    200 for its "Thin" cut), and second-guessing that would be a regression.
+    """
+    derived = _weight_class_for(style)
+    if derived is None:
+        return src_weight
+    if src_weight in (None, 400) and derived != 400:
+        return derived
+    return src_weight
 
 
 def _style_from_names(family, full, ps):
@@ -1210,21 +1327,30 @@ def build_output(font, charstrings, widths, args, out_path):
         best = font.getBestCmap()
         fb.setupCharacterMap({c: best[c] for c in best},
                              allowFallback=True)
+    # fsSelection and macStyle must agree about bold/italic: a mismatch is
+    # flagged by fontTools and makes some rasterisers pick the wrong hinting
+    # style. _fs_selection may trust the SOURCE's bits over the names, so
+    # macStyle is derived from the resolved fsSelection rather than from the
+    # names a second time.
+    fs_selection = _fs_selection(font, family, style, ps,
+                                 typo_style or style)
     fb.setupOS2(sTypoAscender=font["OS/2"].sTypoAscender if "OS/2" in font else upem // 2,
                 sTypoDescender=font["OS/2"].sTypoDescender if "OS/2" in font else -(upem // 4),
                 sTypoLineGap=font["OS/2"].sTypoLineGap if "OS/2" in font else 0,
                 usWinAscent=font["OS/2"].usWinAscent if "OS/2" in font else upem // 2,
                 usWinDescent=font["OS/2"].usWinDescent if "OS/2" in font else upem // 4,
-                usWeightClass=font["OS/2"].usWeightClass if "OS/2" in font else 400,
+                usWeightClass=_resolve_weight_class(
+                    font["OS/2"].usWeightClass if "OS/2" in font else 400,
+                    typo_style or style),
                 fsType=0,
-                fsSelection=_fs_selection(font, family, style, ps,
-                                      typo_style or style),
+                fsSelection=fs_selection,
                 panose=_panose_for(typo_style or style, ps))
     fb.setupPost()
     # macStyle is the Mac/legacy counterpart of OS/2 fsSelection. It is not
     # set by setupOS2, and FontBuilder.setupHead() does not take it either,
     # so it has to be assigned after the head table exists.
-    fb.font["head"].macStyle = _mac_style(family, typo_style or style, ps)
+    fb.font["head"].macStyle = ((1 if fs_selection & 0x20 else 0)
+                                | (2 if fs_selection & 0x01 else 0))
     fb.font["head"].flags |= 0x0103
 
     if args.gasp:
