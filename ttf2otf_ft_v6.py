@@ -749,17 +749,6 @@ def _fs_selection(font, family, style, ps, resolved_style=None):
     return val
 
 
-def _mac_style(family, style, ps):
-    """head.macStyle: bit 0 bold, bit 1 italic."""
-    bold, italic = _style_bits(family, style, ps)
-    val = 0
-    if bold:
-        val |= 1
-    if italic:
-        val |= 2
-    return val
-
-
 def _panose_for(style, ps):
     """Keep a sane PANOSE: bWeight tracks bold, bMidline carries the slant.
 
