@@ -58,6 +58,25 @@ import tempfile
 import subprocess
 from pathlib import Path
 
+# The OS/2 style rules live in a shared module so this converter and the
+# fontTools one (ttf2otf_ft_v6.py) cannot drift apart on how a family's
+# faces are classified. FontForge exposes OS/2 fsSelection as
+# font.os2_stylemap and usWeightClass as font.os2_weight, so the same rules
+# apply unchanged.
+try:
+    from font_style_metadata import (
+        is_italic as _is_italic,
+        is_bold as _is_bold,
+        is_style_word as _is_style_word,
+        style_bits as _style_bits,
+        is_regular_weight as _is_regular_weight,
+        weight_class_for as _weight_class_for,
+        resolve_weight_class as _resolve_weight_class,
+        resolve_fs_selection as _resolve_fs_selection,
+    )
+except ImportError:
+    pass
+
 try:
     import fontforge
 except ImportError:
@@ -1101,6 +1120,52 @@ class FringeKiller:
         except Exception as e:
             self._log(f"Hinting issue: {e}", 'sub')
 
+    # -- Phase 7b: OS/2 style metadata --
+    def phase_style_metadata(self, font):
+        """Repair OS/2.fsSelection and OS/2.usWeightClass.
+
+        A family whose faces all declare usWeightClass=400 (Absolut Pro: all
+        24 faces) gives fontconfig 24 equally-valid Regular candidates, so
+        `fc-match "Absolut Pro"` ties and the winner is arbitrary -- it came
+        back with AbsolutPro-Black. The source makes it worse by setting the
+        REGULAR bit (fsSelection=0x0040) on every face, so copying the
+        source table through leaves all 24 claiming to be the Regular.
+
+        The rules are shared with ttf2otf_ft_v6.py via
+        font_style_metadata, so both converters classify a family the same
+        way. FontForge exposes OS/2 fsSelection as font.os2_stylemap and
+        usWeightClass as font.os2_weight (verified: setting os2_stylemap to
+        0x0020 writes fsSelection=0x0020, and os2_weight to 900 writes
+        usWeightClass=900).
+
+        Nothing here touches the outlines or the metrics.
+        """
+        self._log("Phase 7b: OS/2 style metadata", 'phase')
+        try:
+            names = {}
+            for _lang, name_id, value in font.sfnt_names:
+                names.setdefault(name_id, value)
+            # 'Preferred Styles' is name ID 17 and carries the real style
+            # when the family has more than four weights; 'SubFamily' is the
+            # legacy ID 2 and can only say Regular/Bold/Italic/Bold Italic.
+            style = names.get('Preferred Styles') or names.get('SubFamily') or ''
+
+            src_weight = font.os2_weight
+            new_weight = _resolve_weight_class(src_weight, style)
+            if new_weight != src_weight:
+                font.os2_weight = new_weight
+                self._log(f"  usWeightClass {src_weight} -> {new_weight} "
+                          f"(style '{style}')", 'sub')
+
+            src_fs = font.os2_stylemap
+            new_fs = _resolve_fs_selection(src_fs, style)
+            if new_fs != src_fs:
+                font.os2_stylemap = new_fs
+                self._log(f"  fsSelection 0x{src_fs:04x} -> 0x{new_fs:04x} "
+                          f"(style '{style}')", 'sub')
+        except Exception as e:
+            self._log(f"style metadata issue: {e}", 'sub')
+
     # -- Phase 8: CFF generation --
     def phase_generate(self, font, out_path):
         """Generate OTF/CFF with optimal flags."""
@@ -1215,9 +1280,19 @@ class FringeKiller:
                     # Bit 3 (Force PPEM integer) intentionally NOT set —
                     # Chrome rejects fonts with this flag.
                     head.macStyle &= ~0x18  # clear Outline/Shadow
-                    # Set bold bit only for semibold+ weights
-                    if 'OS/2' in font and font['OS/2'].usWeightClass >= 600:
+                    # macStyle must agree with OS/2 fsSelection about
+                    # bold/italic: fontTools flags a mismatch, and a
+                    # rasteriser that trusts one and not the other picks the
+                    # wrong hinting style. The old rule here set the bold bit
+                    # from usWeightClass >= 600 alone, which both invented a
+                    # bold flag on a "Semi Bold" face and dropped the
+                    # italic bit entirely.
+                    fs_sel = font['OS/2'].fsSelection if 'OS/2' in font else 0
+                    head.macStyle &= ~0x03
+                    if fs_sel & 0x20:
                         head.macStyle |= 0x01
+                    if fs_sel & 0x01:
+                        head.macStyle |= 0x02
             except Exception as e:
                 self._log(f"head flags issue: {e}", 'sub')
 
@@ -1380,6 +1455,8 @@ class FringeKiller:
             self.phase_high_risk_repass(font)
             # Phase 7 (hinting)
             self.phase_hint(font)
+            # Phase 7b (OS/2 style metadata)
+            self.phase_style_metadata(font)
             # Phase 8 (generate)
             os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
             self.phase_generate(font, out_path)
