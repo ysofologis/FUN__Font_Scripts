@@ -599,6 +599,44 @@ A correct decomposition matches fontTools exactly. Measured on Corporate S Pro
 Regular: **13,646** `qCurveTo` runs, **0** mismatches.
 
 
+#### The counter winding trap
+
+A counter is a hole only while it winds **opposite** to the shape that
+encloses it. Wind it the same way and the two cancel under the nonzero
+fill rule: the hole disappears and the glyph renders solid.
+
+FontForge 20251009's `glyph.correctDirection()` decides which contours are
+counters from their bounding boxes. Once `changeWeight()` has thickened the
+strokes, the outer contour of an `e` **overlaps** the upper bowl's box
+instead of cleanly enclosing it, so `correctDirection()` concludes the bowl
+is not a hole and reverses it. The `e` comes out with its upper half
+filled, and so does every glyph built on `e`.
+
+The failure is silent: the areas are right, the bounding boxes are right,
+the contour count is right, the advance widths are right, and the counter
+ratio barely moves. Only the **sign of the counter's area relative to the
+shape enclosing it** changed — and only the rendered output shows it.
+
+**The absolute sign is not the invariant.** FontForge flips every contour of
+every glyph on the way out of TrueType into CFF, so "the counter must
+oppose the outer contour" is true for the source TTF and false for the
+output — for glyphs that render perfectly well (`o`, `O`, `S`, `B`, `eight`,
+`ampersand`, `dollar`). The invariant is the relationship between a
+contour and the contour that **encloses** it.
+
+**Guard it:**
+
+```bash
+python3 check_counter_winding.py Source.ttf Output.otf
+```
+
+Pairs each output glyph's counters with the source's by geometric
+containment — not by position, because `changeWeight()` and
+`removeOverlap()` may merge, split or reorder contours — and exits non-zero
+on any flipped relationship. Measured on Corporate S Pro Demi: **16**
+flipped glyphs before the fix, **0** after.
+
+
 #### `improve_font_rendering.py` (fonttools-based)
 
 Light touch-ups: coordinate rounding, contour simplification, direction correction, outline validation, vertical metrics fix.

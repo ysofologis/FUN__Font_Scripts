@@ -500,6 +500,51 @@ Checks every `qCurveTo` run against fontTools' own
 `decomposeQuadraticSegment()`. A correct decomposition matches exactly —
 measured on Corporate S Pro Regular: **13,646** runs, **0** mismatches.
 
+
+#### The counter winding trap
+
+A counter is a hole only while it winds **opposite** to the shape that
+encloses it. Wind it the same way and the two cancel under the nonzero
+fill rule: the hole disappears and the glyph renders solid.
+
+FontForge 20251009's `glyph.correctDirection()` decides which contours are
+counters from their bounding boxes. Once `changeWeight()` has thickened the
+strokes, the outer contour of an `e` **overlaps** the upper bowl's box
+instead of cleanly enclosing it, so `correctDirection()` concludes the bowl
+is not a hole and reverses it.
+
+Measured on Corporate S Pro Demi at `--width 4 --scale 5 --thickness 10
+--spacing 5 --quantise-curve 400`:
+
+| | before | after |
+|---|---|---|
+| glyphs with a flipped counter | **16** | **0** |
+| `e` upper-bowl ink ratio | 1.500 | **1.173** (source: 1.217) |
+| glyphs whose area changed | — | **0 of 1113** |
+
+The failure is silent: the areas, the bounding boxes, the contour count and
+the advance widths are all right, and the counter ratio barely moves. Only
+the **sign of the counter's area relative to the shape enclosing it**
+changed.
+
+The absolute sign is not the invariant — FontForge flips every contour of
+every glyph on the way out of TrueType into CFF, so "the counter must
+oppose the outer contour" is true for the source TTF and false for the
+output, for glyphs that render perfectly well (`o`, `O`, `S`, `B`, `eight`,
+`ampersand`, `dollar`). The invariant is the relationship between a contour
+and the contour that **encloses** it.
+
+**Guard it:**
+
+```bash
+python3 check_counter_winding.py Source.ttf Output.otf
+```
+
+Pairs each output glyph's counters with the source's by geometric
+containment — not by position, because `changeWeight()` and
+`removeOverlap()` may merge, split or reorder contours — and exits non-zero
+on any flipped relationship.
+
 **Known unrelated failure:** at `--thickness 5`, v5 hangs indefinitely on
 `NeverMindCompact-Thin` — 23 `Internal Error: Unexpected point count in
 SSAddPoints`, zero output files, log frozen while the process keeps
