@@ -311,6 +311,377 @@ def _fl_segments(ops):
     return out
 
 
+def _fl_contour_signed_area(ops):
+    """Signed area of one contour, from a pen recording.
+
+    Uses fontTools' own AreaPen rather than a hand-rolled shoelace. A
+    shoelace over on-curve points is wrong for curves: it ignores the
+    bulge of the Bezier, so a round bowl and its chord-line
+    approximation come out with the same area, and a quadratic's
+    implied on-curve points have to be expanded by hand to be counted at
+    all. AreaPen integrates the curve properly.
+
+    The sign is what matters: positive and negative mean opposite
+    directions of travel around the contour.
+    """
+    from fontTools.pens.areaPen import AreaPen
+
+    pen = AreaPen(None)
+    for op, args in ops:
+        try:
+            getattr(pen, op)(*args)
+        except Exception:
+            continue
+    return pen.value
+
+
+def _fl_split_contours(ops):
+    """Split a pen recording into per-contour op lists.
+
+    Each list starts with its own moveTo and ends with its closePath, so
+    the list can be replayed to a pen unchanged.
+    """
+    contours = []
+    cur = None
+    for op, args in ops:
+        if op == 'moveTo':
+            cur = [(op, args)]
+            contours.append(cur)
+        elif cur is not None:
+            cur.append((op, args))
+            if op in ('closePath', 'endPath'):
+                cur = None
+    return contours
+
+
+def _fl_contour_bbox(ops):
+    """Bounding box of one contour, from a pen recording."""
+    xs = []
+    ys = []
+    for op, args in ops:
+        if op == 'moveTo':
+            xs.append(args[0][0])
+            ys.append(args[0][1])
+        elif op == 'lineTo':
+            xs.append(args[0][0])
+            ys.append(args[0][1])
+        elif op == 'curveTo':
+            for p in args:
+                xs.append(p[0])
+                ys.append(p[1])
+        elif op == 'qCurveTo':
+            for p in args:
+                if p is not None:
+                    xs.append(p[0])
+                    ys.append(p[1])
+        elif op in ('closePath', 'endPath'):
+            break
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _fl_bbox_contains(outer, inner):
+    """True when inner's box lies within outer's box."""
+    return (inner[0] >= outer[0] and inner[1] >= outer[1]
+            and inner[2] <= outer[2] and inner[3] <= outer[3])
+
+
+def _fl_pair_counters(contours, areas):
+    """Pair each contour with the outer contour that encloses it.
+
+    The pairing is by GEOMETRIC CONTAINMENT, not by position in the
+    glyph. changeWeight() and removeOverlap() may merge, split or
+    reorder contours -- an accent becomes its own contour, a counter
+    moves -- so contour index N in the source is not contour index N in
+    the output.
+
+    A contour with no enclosing contour is an OUTER shape (the body of
+    the glyph, or a detached accent). It is not a counter and takes no
+    part in the comparison; only the relationships between a contour
+    and its enclosing shape matter.
+
+    Returns {inner_index: outer_index} for the contours that are
+    enclosed by another, or None when there are none.
+    """
+    boxes = [_fl_contour_bbox(c) for c in contours]
+    real = [i for i, a in enumerate(areas) if abs(a) > 1.0]
+    if len(real) < 2:
+        return None
+    pairs = {}
+    for i in real:
+        # the outer contour of i is the largest real contour whose box
+        # contains i's box and which is not i itself
+        best = None
+        for j in real:
+            if j == i or boxes[j] is None or boxes[i] is None:
+                continue
+            if not _fl_bbox_contains(boxes[j], boxes[i]):
+                continue
+            if best is None or abs(areas[j]) > abs(areas[best]):
+                best = j
+        if best is not None:
+            pairs[i] = best
+    return pairs or None
+
+
+def repair_counter_winding(out_path, src_path=None):
+    """Restore each counter's winding RELATIVE to the source glyph.
+
+    Why this is needed
+    ------------------
+    FontForge 20251009's glyph.correctDirection() decides which contours
+    are counters from their bounding boxes. After changeWeight() has
+    thickened the strokes, the outer contour of an 'e' overlaps the upper
+    bowl's bounding box instead of cleanly enclosing it, so
+    correctDirection() concludes the bowl is not a hole and reverses it.
+    The counter then fills in: 'e' renders as a solid blob with a slot,
+    and every glyph built on 'e' (egrave, eacute, ecircumflex, ...) goes
+    with it.
+
+    The failure is silent. FontForge's own contour accounting still
+    reports the right areas and bounding boxes; only the RELATIVE
+    winding of the contours changes, and only the rendered output shows
+    it.
+
+    Why the SOURCE is the reference
+    -------------------------------
+    The absolute winding sign is not a reliable invariant here: FontForge
+    flips every contour of every glyph on the way out of TrueType into
+    CFF, so "the counter must oppose the outer contour" is true for the
+    source TTF and false for the output, for glyphs that render perfectly
+    well ('o', 'O', 'S'). What IS invariant is the RELATIONSHIP between
+    a contour and the outer contour that encloses it: if the source's
+    counter winds opposite to its enclosing shape, the output's must
+    too.
+
+    So the repair pairs each output contour with the output contour that
+    encloses it, pairs the source the same way, and reverses any output
+    contour whose relationship changed.
+
+    Measured on Corporate S Pro Demi at --width 4 --scale 5 --thickness
+    10 --spacing 5 --quantise-curve 400: 176 of 1080 comparable glyphs
+    came out with a flipped counter relationship, and the 'e' counter's
+    area sign went from +86551 in the source to +686405 in the output --
+    the bowl and the outer shape now wind the same way, so the bowl is
+    solid.
+
+    Why it runs here and not in FontForge
+    -------------------------------------
+    The FontForge Python layer cannot express the edit. On 20251009,
+    glyph.foreground returns a COPY of the layer -- mutating a contour
+    from it reports success and changes nothing -- so a repair written
+    there would claim work it cannot perform. fontTools can rewrite the
+    charstring, so the fix lives in the same post-pass as Phase 8b.
+
+    Returns (repaired, checked) or None if the font could not be read.
+    """
+    if not FLATTEN_TOOLS:
+        return None
+    from fontTools.pens.recordingPen import RecordingPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib import TTFont as _FT
+
+    try:
+        font = _FT(out_path)
+    except Exception:
+        return None
+
+    is_cff = ('CFF ' in font) or ('CFF2' in font)
+    if not is_cff and 'glyf' not in font:
+        try:
+            font.close()
+        except Exception:
+            pass
+        return None
+
+    key = 'CFF ' if 'CFF ' in font else ('CFF2' if 'CFF2' in font else None)
+    glyph_set = font.getGlyphSet()
+
+    # The source is the reference for the winding RELATIONSHIP. Without it
+    # there is nothing to compare against, so there is nothing to repair.
+    src_set = None
+    if src_path:
+        try:
+            src_font = _FT(src_path)
+            src_set = src_font.getGlyphSet()
+        except Exception:
+            src_set = None
+
+    repaired = 0
+    checked = 0
+
+    if is_cff:
+        top = font[key].cff.topDictIndex[0]
+        char_strings = top.CharStrings
+        private = getattr(top, 'Private', None)
+        global_subrs = getattr(top, 'GlobalSubrs', None)
+
+    for name in font.getGlyphOrder():
+        rec = RecordingPen()
+        try:
+            glyph_set[name].draw(rec)
+        except Exception:
+            continue
+        contours = _fl_split_contours(rec.value)
+        out_areas = [_fl_contour_signed_area(c) for c in contours]
+        out_pairs = _fl_pair_counters(contours, out_areas)
+        if not out_pairs:
+            continue
+
+        if src_set is None:
+            continue
+        srec = RecordingPen()
+        try:
+            src_set[name].draw(srec)
+        except Exception:
+            continue
+        src_contours = _fl_split_contours(srec.value)
+        src_areas = [_fl_contour_signed_area(c) for c in src_contours]
+        src_pairs = _fl_pair_counters(src_contours, src_areas)
+        if not src_pairs:
+            continue
+
+        # Build the source's relationship table: for each contour, the
+        # sign of its area relative to the outer contour that encloses it.
+        src_rel = {}
+        for i, j in src_pairs.items():
+            src_rel[i] = (src_areas[i] > 0) == (src_areas[j] > 0)
+        out_rel = {}
+        for i, j in out_pairs.items():
+            out_rel[i] = (out_areas[i] > 0) == (out_areas[j] > 0)
+
+        # The output's contours and the source's contours are matched by
+        # GEOMETRY, not by their winding: a source counter is the contour
+        # whose box best matches the output contour's box. Matching by
+        # winding would be circular -- the winding is exactly what is
+        # being corrected.
+        bad = []
+        for i in out_rel:
+            oi = _fl_contour_bbox(contours[i])
+            best = None
+            bestd = None
+            for k in src_rel:
+                kb = _fl_contour_bbox(src_contours[k])
+                if kb is None or oi is None:
+                    continue
+                d = ((kb[0] - oi[0]) ** 2 + (kb[1] - oi[1]) ** 2
+                     + (kb[2] - oi[2]) ** 2 + (kb[3] - oi[3]) ** 2)
+                if bestd is None or d < bestd:
+                    bestd, best = d, k
+            if best is None:
+                continue
+            if src_rel[best] == out_rel[i]:
+                continue
+            # the relationship differs from the source's -> flip it
+            checked += 1
+            bad.append(i)
+
+        if not bad:
+            continue
+
+        try:
+            if is_cff:
+                width = font['hmtx'][name][0] if 'hmtx' in font else None
+                pen = T2CharStringPen(width, glyph_set,
+                                      roundTolerance=0)
+                for ci, cop in enumerate(contours):
+                    _fl_emit_contour(pen, cop, reverse=(ci in bad))
+                char_strings[name].program = pen.getCharString(
+                    private=private,
+                    globalSubrs=global_subrs).program
+            else:
+                pen = TTGlyphPen(None)
+                for ci, cop in enumerate(contours):
+                    _fl_emit_contour(pen, cop, reverse=(ci in bad))
+                font['glyf'][name] = pen.glyph()
+            repaired += len(bad)
+        except Exception:
+            continue
+
+    saved = False
+    try:
+        font.save(out_path)
+        saved = True
+    except Exception:
+        saved = False
+    try:
+        font.close()
+    except Exception:
+        pass
+    if not saved:
+        return None
+    return (repaired, checked)
+
+
+def _fl_emit_contour(pen, cop, reverse=False):
+    """Emit one contour to a pen, optionally with its direction reversed.
+
+    A contour is a sequence of segments, each running from an on-curve
+    point to the next on-curve point, with optional off-curve control
+    points in between. Reversing the direction means walking the segments
+    backwards: each segment runs from its old end point back to its old
+    start point, with its two control points swapped.
+
+    Quadratic runs are expanded to cubics first, using the same implied
+    midpoints the pen protocol defines, so that a reversed contour has
+    exactly the same shape as the original.
+    """
+    if not reverse:
+        # Nothing to change: replay the contour verbatim.
+        for op, args in cop:
+            getattr(pen, op)(*args)
+        return
+
+    # Build the segment list: (start, kind, payload, end).
+    steps = []
+    cur = None
+    for op, args in cop:
+        if op == 'moveTo':
+            cur = args[0]
+        elif op == 'lineTo':
+            if cur is not None:
+                steps.append((cur, 'line', args[0], args[0]))
+                cur = args[0]
+        elif op == 'curveTo':
+            if cur is not None:
+                c1, c2, p3 = args
+                steps.append((cur, 'cubic', (c1, c2, p3), p3))
+                cur = p3
+        elif op == 'qCurveTo':
+            cur, quads = _fl_decompose_quadratic(cur, args)
+            for q, nxt in quads:
+                c1, c2 = _fl_quad_to_cubic(cur, q, nxt)
+                steps.append((cur, 'cubic', (c1, c2, nxt), nxt))
+                cur = nxt
+        elif op in ('closePath', 'endPath'):
+            break
+    if not steps:
+        for op, args in cop:
+            getattr(pen, op)(*args)
+        return
+
+    # Reverse: walk the segments backwards, each one from its old end
+    # point to its old start point, with its control points swapped.
+    rev = []
+    for start, kind, payload, end in reversed(steps):
+        if kind == 'line':
+            rev.append((end, 'line', payload, start))
+        else:
+            c1, c2, p3 = payload
+            rev.append((p3, 'cubic', (c2, c1, start), start))
+
+    pen.moveTo(rev[0][0])
+    for start, kind, payload, end in rev:
+        if kind == 'line':
+            pen.lineTo(end)
+        else:
+            c1, c2, p3 = payload
+            pen.curveTo(c1, c2, p3)
+    pen.closePath()
+
+
 class _FlattenPen:
     """Filter pen: emit lineTo where the source had a straight segment."""
 
@@ -1491,6 +1862,36 @@ class FringeKiller:
             self._log(f"Phase 8b: straightened {flattened} near-straight "
                       f"curves back onto their chords ({kept} kept)", 'sub')
 
+    def phase_repair_winding(self, in_path, out_path):
+        """Phase 8c: restore counter winding that FontForge flipped.
+
+        FontForge's glyph.correctDirection() can decide that a counter
+        is not a counter once changeWeight has thickened the strokes,
+        and reverse it -- which fills the counter in. See
+        repair_counter_winding() for the full account.
+        """
+        if not FLATTEN_TOOLS:
+            if self.verbose:
+                self._log("Phase 8c: winding repair skipped (fontTools "
+                          "unavailable)", 'sub')
+            return
+        try:
+            result = repair_counter_winding(out_path, in_path)
+        except Exception as e:
+            self._log(f"Phase 8c issue: {e}", 'sub')
+            return
+        if result is None:
+            if self.verbose:
+                self._log("Phase 8c: winding repair skipped (unreadable)",
+                          'sub')
+            return
+        repaired, checked = result
+        self.stats['counters_repaired'] = repaired
+        self.stats['counters_checked'] = checked
+        if repaired:
+            self._log(f"Phase 8c: repaired {repaired} inverted counter(s) "
+                      f"in {checked} glyph(s)", 'sub')
+
     # -- Validation --
     def validate(self, in_path, out_path):
         """Verify output font is loadable and has reasonable structure."""
@@ -1540,6 +1941,9 @@ class FringeKiller:
             self.phase_generate(font, out_path)
             # Phase 8b: straighten curves changeWeight created
             self.phase_flatten(in_path, out_path)
+            # Phase 8c: repair counters that FontForge's correctDirection
+            # flipped (it can mistake a thickened 'e' bowl for a solid shape)
+            self.phase_repair_winding(in_path, out_path)
             # Phase 9 (fontTools post-processing)
             self.phase_postprocess(out_path)
             # Validate
