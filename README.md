@@ -567,6 +567,38 @@ v8.1 features (all included in v8.2):
 
 
 
+#### `check_quad_decomposition.py` (fontTools-based, guard)
+
+Regression guard for the TrueType quadratic decomposition. Every script that
+reads TrueType outlines must turn `qCurveTo` runs into concrete segments, and
+getting that wrong is **silent**: the output is still a valid font with the
+right contour count and the right bounding boxes — it just has faceted bowls
+where the source had curves.
+
+```bash
+python3 check_quad_decomposition.py Font.ttf Font.otf
+```
+
+Checks every `qCurveTo` run against fontTools' own
+`decomposeQuadraticSegment()`, the reference implementation in the library
+that wrote the file. Exits non-zero on any disagreement.
+
+**The quadratic decomposition trap.** The pen protocol says
+`qCurveTo(p0, p1, ..., pn)` where the **last point is on-curve** and every
+point before it is an off-curve control. The wrong decomposition keeps that
+final on-curve point in the control list. The invented segment's control then
+equals its own endpoint, so the cubic degenerates onto its chord with a bow of
+exactly **0.00** — and any downstream "is this segment straight?" test accepts
+it and flattens it to a `lineTo`.
+
+On a purely quadratic glyph (Corporate S Pro `o`, `s`, `e`, `a`, `O`) that
+straightens half the outline and facets every bowl. The failure is invisible
+in the output bytes: the contour count and the bounding boxes are unchanged.
+
+A correct decomposition matches fontTools exactly. Measured on Corporate S Pro
+Regular: **13,646** `qCurveTo` runs, **0** mismatches.
+
+
 #### `improve_font_rendering.py` (fonttools-based)
 
 Light touch-ups: coordinate rounding, contour simplification, direction correction, outline validation, vertical metrics fix.

@@ -122,6 +122,52 @@ def _quad_to_cubic(p0, q, p2):
     return c1, c2
 
 
+def _implied_start(controls):
+    """Start point implied by an all-off-curve contour.
+
+    TrueType may store a contour with no on-curve point at all; the implied
+    one is the midpoint between the last and first control points.
+    """
+    return ((controls[-1][0] + controls[0][0]) / 2.0,
+            (controls[-1][1] + controls[0][1]) / 2.0)
+
+
+def _decompose_quadratic(cur, points):
+    """Split a TrueType quadratic run into atomic (ctrl, on-curve-end) pairs.
+
+    Pen protocol: qCurveTo(p0, p1, ..., pn) where the LAST point is
+    on-curve and every point before it is an off-curve control. Between two
+    consecutive control points there is an implied on-curve point at their
+    midpoint. A trailing None means the contour has no on-curve point at
+    all, and closes on the implied midpoint of the last and first controls.
+
+    Matches fontTools' decomposeQuadraticSegment().
+    """
+    pts = list(points)
+    all_off = bool(pts) and pts[-1] is None
+    if all_off:
+        controls = [p for p in pts if p is not None]
+        if not controls:
+            return cur, []
+        end = _implied_start(controls)
+        if cur is None:
+            cur = end
+    else:
+        controls = [p for p in pts[:-1] if p is not None]
+        end = pts[-1] if pts else cur
+    if cur is None or end is None or not controls:
+        return cur, []
+    segments = []
+    for i, q in enumerate(controls):
+        if i == len(controls) - 1:
+            nxt = end
+        else:
+            nxt = ((q[0] + controls[i + 1][0]) / 2.0,
+                   (q[1] + controls[i + 1][1]) / 2.0)
+        segments.append((q, nxt))
+    return cur, segments
+
+
 class StraightenPen:
     """Filter pen: emit lineTo for near-straight curves, pass the rest.
 
@@ -215,25 +261,18 @@ class StraightenPen:
             self._emit_cubic(points[i], points[i + 1], points[i + 2])
 
     def qCurveTo(self, *points):
-        # A trailing None means an all-off-curve closed contour; treat the
-        # contour start as the final on-curve point and close it.
-        end = points[-1] if points[-1] is not None else self._pt
-        pts = list(points[:-1]) if points[-1] is not None else list(points)
-        if end is None:
+        # A trailing None means an all-off-curve closed contour; the
+        # implied start is the midpoint of the last and first controls.
+        cur, quads = _decompose_quadratic(self._pt, points)
+        if cur is None:
             return
-        cur = self._pt
-        for idx, q in enumerate(pts):
-            if idx == len(pts) - 1:
-                nxt = end
-            else:
-                nxt = (pts[idx + 1][0], pts[idx + 1][1])
-            if cur is None:
-                self.moveTo(q)
-                cur = q
-                continue
+        if self._pt is None:
+            self.moveTo(cur)
+        for q, nxt in quads:
             c1, c2 = _quad_to_cubic(cur, q, nxt)
             self._emit_cubic(c1, c2, nxt)
             cur = nxt
+        self._pt = cur
 
     def closePath(self):
         self.outPen.closePath()
@@ -271,18 +310,13 @@ def _segments(ops):
                 out.append(("cubic", cur, args[0], args[1], args[2]))
             cur = args[2]
         elif op == "qCurveTo":
-            pts = list(args)
-            end = cur if pts and pts[-1] is None else pts[-1]
-            offs = [p for p in pts if p is not None]
-            if cur is not None and end is not None:
-                for i, q in enumerate(offs):
-                    nxt = end if i == len(offs) - 1 else \
-                        ((q[0] + offs[i + 1][0]) / 2.0,
-                         (q[1] + offs[i + 1][1]) / 2.0)
-                    c1, c2 = _quad_to_cubic(cur, q, nxt)
-                    out.append(("cubic", cur, c1, c2, nxt))
-                    cur = nxt
-            cur = end
+            cur, quads = _decompose_quadratic(cur, args)
+            for q, nxt in quads:
+                c1, c2 = _quad_to_cubic(cur, q, nxt)
+                out.append(("cubic", cur, c1, c2, nxt))
+                cur = nxt
+            if quads:
+                cur = quads[-1][1]
     return out
 
 

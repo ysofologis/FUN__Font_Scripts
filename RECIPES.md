@@ -461,6 +461,45 @@ The threshold mode is still useful without `--source` when no original is
 available — it catches the sub-unit artifacts `changeWeight` leaves on
 medium and long segments. But it is not a substitute for the source.
 
+#### The quadratic decomposition trap
+
+Both the in-script Phase 8b pass and this standalone script have to turn
+`qCurveTo` runs into concrete segments. Getting that wrong is **silent**:
+the output is still a valid font with the right contour count and the right
+bounding boxes — it just has faceted bowls where the source had curves.
+
+The pen protocol says `qCurveTo(p0, p1, ..., pn)` where the **last point is
+on-curve** and every point before it is an off-curve control, with an implied
+on-curve point at the midpoint of each consecutive control pair. The wrong
+decomposition keeps that final on-curve point in the control list. The
+invented segment's control then equals its own endpoint, so the cubic
+degenerates onto its chord with a bow of exactly **0.00** — and the "was this
+straight in the source?" test then accepts it and flattens it to a `lineTo`.
+
+On a purely quadratic glyph this straightens half the outline. Measured on
+Corporate S Pro Regular at `--width 4 --scale 5 --thickness 10 --spacing 5
+--quantise-curve 400`:
+
+| | before | after |
+|---|---|---|
+| straight lines in the output | 15,368 | **10,633** |
+| glyphs with faceted bowls | **770 of 1113** | 0 |
+| glyphs whose ink differs >2% from the correct reference | **271** | **16** |
+
+The original purpose is unaffected: the `changeWeight` diagonals still
+straighten (Z/N/A/V/W/X/M/K/Y → bow **0.00u**) and real curves stay curved
+(`S`, `O`, `o`, `a`, `e`, `c`, `C`, `G`, `B`, `P`, `R` unchanged).
+
+**Guard it:**
+
+```bash
+python3 check_quad_decomposition.py Font.ttf Font.otf
+```
+
+Checks every `qCurveTo` run against fontTools' own
+`decomposeQuadraticSegment()`. A correct decomposition matches exactly —
+measured on Corporate S Pro Regular: **13,646** runs, **0** mismatches.
+
 **Known unrelated failure:** at `--thickness 5`, v5 hangs indefinitely on
 `NeverMindCompact-Thin` — 23 `Internal Error: Unexpected point count in
 SSAddPoints`, zero output files, log frozen while the process keeps

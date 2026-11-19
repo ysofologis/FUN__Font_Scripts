@@ -232,6 +232,59 @@ def _fl_quad_to_cubic(p0, q, p2):
     return c1, c2
 
 
+def _fl_implied_start(offs):
+    """Start point implied by an all-off-curve contour.
+
+    TrueType may store a contour with no on-curve point at all; the implied
+    one is the midpoint between the last and first control points.
+    """
+    return ((offs[-1][0] + offs[0][0]) / 2.0,
+            (offs[-1][1] + offs[0][1]) / 2.0)
+
+
+def _fl_decompose_quadratic(cur, points):
+    """Split a TrueType quadratic run into atomic (ctrl, on-curve-end) pairs.
+
+    Pen protocol: qCurveTo(p0, p1, ..., pn) where the LAST point is
+    on-curve and every point before it is an off-curve control. Between two
+    consecutive control points there is an implied on-curve point at their
+    midpoint. A trailing None means the contour has no on-curve point at
+    all, and closes on the implied midpoint of the last and first controls.
+
+    The bug this replaces: the old code took `offs = [p for p in pts if p is
+    not None]`, which keeps the final ON-CURVE point in the control list.
+    That control then equals its own segment endpoint, so the cubic
+    degenerates onto its chord with a bow of exactly 0.00 -- and the
+    "was this straight in the source?" test in _FlattenPen then treats it
+    as a straight segment and flattens it to a lineTo. On a purely
+    quadratic glyph (Corporate S Pro 'o', 's', 'e', 'a', 'O') that
+    straightens half the outline and facets every bowl.
+
+    This matches fontTools' decomposeQuadraticSegment().
+    """
+    pts = list(points)
+    all_off = bool(pts) and pts[-1] is None
+    if all_off:
+        controls = [p for p in pts if p is not None]
+        end = _fl_implied_start(controls) if controls else None
+        if cur is None:
+            cur = end
+    else:
+        controls = [p for p in pts[:-1] if p is not None]
+        end = pts[-1] if pts else cur
+    if cur is None or end is None or not controls:
+        return cur, []
+    segments = []
+    for i, q in enumerate(controls):
+        if i == len(controls) - 1:
+            nxt = end
+        else:
+            nxt = ((q[0] + controls[i + 1][0]) / 2.0,
+                   (q[1] + controls[i + 1][1]) / 2.0)
+        segments.append((q, nxt))
+    return cur, segments
+
+
 def _fl_segments(ops):
     """Split a pen recording into ('line'|'cubic', start, ..., end)."""
     out = []
@@ -248,18 +301,13 @@ def _fl_segments(ops):
                 out.append(('cubic', cur, args[0], args[1], args[2]))
             cur = args[2]
         elif op == 'qCurveTo':
-            pts = list(args)
-            end = cur if pts and pts[-1] is None else pts[-1]
-            offs = [p for p in pts if p is not None]
-            if cur is not None and end is not None:
-                for i, q in enumerate(offs):
-                    nxt = end if i == len(offs) - 1 else \
-                        ((q[0] + offs[i + 1][0]) / 2.0,
-                         (q[1] + offs[i + 1][1]) / 2.0)
-                    c1, c2 = _fl_quad_to_cubic(cur, q, nxt)
-                    out.append(('cubic', cur, c1, c2, nxt))
-                    cur = nxt
-            cur = end
+            cur, quads = _fl_decompose_quadratic(cur, args)
+            for q, nxt in quads:
+                c1, c2 = _fl_quad_to_cubic(cur, q, nxt)
+                out.append(('cubic', cur, c1, c2, nxt))
+                cur = nxt
+            if quads:
+                cur = quads[-1][1]
     return out
 
 
@@ -307,22 +355,19 @@ class _FlattenPen:
             self._pt = p3
 
     def qCurveTo(self, *points):
-        pts = list(points)
-        end = self._pt if pts and pts[-1] is None else pts[-1]
-        offs = [p for p in pts if p is not None]
-        if end is None:
+        cur, quads = _fl_decompose_quadratic(self._pt, points)
+        if cur is None:
+            # All-off-curve contour with no implied start available.
             return
-        cur = self._pt
-        for i, q in enumerate(offs):
-            nxt = end if i == len(offs) - 1 else \
-                ((q[0] + offs[i + 1][0]) / 2.0, (q[1] + offs[i + 1][1]) / 2.0)
-            if cur is None:
-                self.moveTo(q)
-                cur = q
-                continue
+        if self._pt is None:
+            # The contour starts at the implied midpoint of the last and
+            # first control points, so the pen needs an explicit moveTo.
+            self.moveTo(cur)
+        for q, nxt in quads:
             c1, c2 = _fl_quad_to_cubic(cur, q, nxt)
             self.curveTo(c1, c2, nxt)
             cur = nxt
+        self._pt = cur
 
     def closePath(self):
         self.outPen.closePath()
