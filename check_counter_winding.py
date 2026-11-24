@@ -147,24 +147,20 @@ def check(src_path, out_path, verbose=True):
         s_rel = relationships(sc)
         o_rel = relationships(oc)
         if len(s_rel) != len(o_rel):
+            # The converter merged or split contours (removeOverlap does
+            # that), so the source's contours cannot be paired with the
+            # output's. Not a winding fault -- just not checkable.
             recount.append((g, s_rel, o_rel))
             continue
         compared += 1
-        # Match the source's counters to the output's by GEOMETRY (the
-        # winding is what is being checked, so it cannot be the key).
+        # A counter that winds the SAME way as the shape enclosing it is
+        # not a hole: it cancels under the nonzero fill rule and the
+        # counter fills in. That is the only fault worth reporting, and
+        # it is decidable from the output alone.
         bad = []
         for i, (area, box, rel) in o_rel.items():
-            best = None
-            bestd = None
-            for k, (sarea, sbox, srel) in s_rel.items():
-                d = ((sbox[0] - box[0]) ** 2 + (sbox[1] - box[1]) ** 2
-                     + (sbox[2] - box[2]) ** 2 + (sbox[3] - box[3]) ** 2)
-                if bestd is None or d < bestd:
-                    bestd, best = d, k
-            if best is None:
-                continue
-            if s_rel[best][2] != rel:
-                bad.append((g, box, rel, s_rel[best][2]))
+            if rel:
+                bad.append((g, box))
         if bad:
             flipped.append(bad[0])
 
@@ -176,11 +172,10 @@ def check(src_path, out_path, verbose=True):
           (status, out_path.rsplit('/', 1)[-1], compared, len(flipped),
            len(recount)))
     if verbose:
-        for g, box, rel, srel in flipped[:10]:
-            print('       %-18s counter bbox=%s  output_rel=%s '
-                  'source_rel=%s' % (g, tuple(round(v) for v in box),
-                                     'opposite' if not rel else 'SAME',
-                                     'opposite' if not srel else 'SAME'))
+        for g, box in flipped[:10]:
+            print('       %-18s counter bbox=%s  winds the SAME way as '
+                  'the shape enclosing it -> filled in'
+                  % (g, tuple(round(v) for v in box)))
     return len(flipped)
 
 
@@ -194,15 +189,15 @@ def main():
         bad += check(src_path, out_path)
     print()
     if bad:
-        print('FAIL: %d glyph(s) have a counter that no longer winds '
-              'opposite to the shape enclosing it.' % bad)
+        print('FAIL: %d glyph(s) have a counter that winds the SAME way '
+              'as the shape enclosing it.' % bad)
         print('      Such a counter is not a hole: under the nonzero fill')
         print('      rule it cancels the shape around it and fills in.')
         print('      FontForge 20251009\'s glyph.correctDirection() can')
         print('      cause this once changeWeight() has thickened the')
         print('      strokes.')
         return 1
-    print('PASS: every counter still winds opposite to its container.')
+    print('PASS: every counter winds opposite to the shape enclosing it.')
     return 0
 
 

@@ -425,8 +425,8 @@ def _fl_pair_counters(contours, areas):
     return pairs or None
 
 
-def repair_counter_winding(out_path, src_path=None):
-    """Restore each counter's winding RELATIVE to the source glyph.
+def repair_counter_winding(out_path):
+    """Make every counter wind opposite to the shape that encloses it.
 
     Why this is needed
     ------------------
@@ -440,31 +440,48 @@ def repair_counter_winding(out_path, src_path=None):
     with it.
 
     The failure is silent. FontForge's own contour accounting still
-    reports the right areas and bounding boxes; only the RELATIVE
-    winding of the contours changes, and only the rendered output shows
-    it.
+    reports the right areas and bounding boxes; only the winding of the
+    counter changes, and only the rendered output shows it.
 
-    Why the SOURCE is the reference
-    -------------------------------
-    The absolute winding sign is not a reliable invariant here: FontForge
-    flips every contour of every glyph on the way out of TrueType into
-    CFF, so "the counter must oppose the outer contour" is true for the
-    source TTF and false for the output, for glyphs that render perfectly
-    well ('o', 'O', 'S'). What IS invariant is the RELATIONSHIP between
-    a contour and the outer contour that encloses it: if the source's
-    counter winds opposite to its enclosing shape, the output's must
-    too.
+    The rule
+    --------
+    A counter is a hole only while it winds OPPOSITE to the shape that
+    encloses it. Wind it the same way and the two cancel under the
+    nonzero fill rule: the counter fills in.
 
-    So the repair pairs each output contour with the output contour that
-    encloses it, pairs the source the same way, and reverses any output
-    contour whose relationship changed.
+    So the repair is decidable from the OUTPUT ALONE: find every contour
+    that is enclosed by another contour, and reverse any that winds the
+    same way as its container.
+
+    What this must NOT be compared against
+    --------------------------------------
+    The source font. A shape can express its counter by OVERLAP rather
+    than by a hole: the outer contour's path runs around the INSIDE of
+    the counter and a second contour closes it from the other side. In
+    such a shape the two contours overlap, so the "counter" winds the
+    SAME way as the shape around it.
+
+    Sofia Sans' 'A' is exactly that. In the source, the outer contour
+    has area -108025 and the counter -21719 -- the same sign, because
+    the counter is an overlap region and not a hole. changeWeight() plus
+    removeOverlap() resolve that overlap into a real hole (counter
+    -42224, opposite the outer), which renders correctly.
+
+    An earlier version of this repair compared the output's relationship
+    with the SOURCE's and reversed any that differed. On the 'A' that
+    "corrected" a perfectly good output: it reversed the counter from
+    -42224 to +42224 and the glyph's ink went from 135533 to 177306 --
+    the upper triangle filled in solid.
+
+    The absolute sign is not comparable across the conversion either.
+    FontForge flips every contour of every glyph on the way out of
+    TrueType into CFF, so 'o', 'O' and 'S' come out with every contour
+    positive and still render perfectly well.
 
     Measured on Corporate S Pro Demi at --width 4 --scale 5 --thickness
-    10 --spacing 5 --quantise-curve 400: 176 of 1080 comparable glyphs
-    came out with a flipped counter relationship, and the 'e' counter's
-    area sign went from +86551 in the source to +686405 in the output --
-    the bowl and the outer shape now wind the same way, so the bowl is
-    solid.
+    10 --spacing 5 --quantise-curve 400: 16 glyphs came out with a
+    counter winding the same way as its container, and the 'e' bowl
+    filled in.
 
     Why it runs here and not in FontForge
     -------------------------------------
@@ -499,16 +516,6 @@ def repair_counter_winding(out_path, src_path=None):
     key = 'CFF ' if 'CFF ' in font else ('CFF2' if 'CFF2' in font else None)
     glyph_set = font.getGlyphSet()
 
-    # The source is the reference for the winding RELATIONSHIP. Without it
-    # there is nothing to compare against, so there is nothing to repair.
-    src_set = None
-    if src_path:
-        try:
-            src_font = _FT(src_path)
-            src_set = src_font.getGlyphSet()
-        except Exception:
-            src_set = None
-
     repaired = 0
     checked = 0
 
@@ -530,53 +537,36 @@ def repair_counter_winding(out_path, src_path=None):
         if not out_pairs:
             continue
 
-        if src_set is None:
-            continue
-        srec = RecordingPen()
-        try:
-            src_set[name].draw(srec)
-        except Exception:
-            continue
-        src_contours = _fl_split_contours(srec.value)
-        src_areas = [_fl_contour_signed_area(c) for c in src_contours]
-        src_pairs = _fl_pair_counters(src_contours, src_areas)
-        if not src_pairs:
-            continue
-
-        # Build the source's relationship table: for each contour, the
-        # sign of its area relative to the outer contour that encloses it.
-        src_rel = {}
-        for i, j in src_pairs.items():
-            src_rel[i] = (src_areas[i] > 0) == (src_areas[j] > 0)
         out_rel = {}
         for i, j in out_pairs.items():
             out_rel[i] = (out_areas[i] > 0) == (out_areas[j] > 0)
 
-        # The output's contours and the source's contours are matched by
-        # GEOMETRY, not by their winding: a source counter is the contour
-        # whose box best matches the output contour's box. Matching by
-        # winding would be circular -- the winding is exactly what is
-        # being corrected.
+        # A counter that winds the SAME way as the shape enclosing it is
+        # not a hole: under the nonzero fill rule the two cancel and the
+        # counter fills in. That is the only condition worth repairing,
+        # and it is decidable from the OUTPUT alone -- no reference to
+        # the source is needed.
+        #
+        # The source must NOT be used as the reference for this. A shape
+        # can express its counter by OVERLAP rather than by a hole: the
+        # outer contour's path runs around the inside of the counter and
+        # a second contour closes it from the other side. The source's
+        # 'A' is exactly that -- outer -108025 and counter -21719, the
+        # SAME sign, because the counter is an overlap region and not a
+        # hole. Comparing the output against the source's sign would
+        # then "correct" a perfectly good output: changeWeight plus
+        # removeOverlap have already resolved the overlap into a real
+        # hole (counter -42224, opposite the outer), which renders
+        # correctly, and flipping it back fills the 'A' solid.
+        #
+        # Measured on Sofia Sans Regular: the old rule flipped the 'A'
+        # counter and took its ink from 135533 to 177306.
         bad = []
-        for i in out_rel:
-            oi = _fl_contour_bbox(contours[i])
-            best = None
-            bestd = None
-            for k in src_rel:
-                kb = _fl_contour_bbox(src_contours[k])
-                if kb is None or oi is None:
-                    continue
-                d = ((kb[0] - oi[0]) ** 2 + (kb[1] - oi[1]) ** 2
-                     + (kb[2] - oi[2]) ** 2 + (kb[3] - oi[3]) ** 2)
-                if bestd is None or d < bestd:
-                    bestd, best = d, k
-            if best is None:
-                continue
-            if src_rel[best] == out_rel[i]:
-                continue
-            # the relationship differs from the source's -> flip it
-            checked += 1
-            bad.append(i)
+        for i, rel in out_rel.items():
+            if rel:
+                # winds the same way as its container -> filled
+                checked += 1
+                bad.append(i)
 
         if not bad:
             continue
@@ -1862,7 +1852,7 @@ class FringeKiller:
             self._log(f"Phase 8b: straightened {flattened} near-straight "
                       f"curves back onto their chords ({kept} kept)", 'sub')
 
-    def phase_repair_winding(self, in_path, out_path):
+    def phase_repair_winding(self, out_path):
         """Phase 8c: restore counter winding that FontForge flipped.
 
         FontForge's glyph.correctDirection() can decide that a counter
@@ -1876,7 +1866,7 @@ class FringeKiller:
                           "unavailable)", 'sub')
             return
         try:
-            result = repair_counter_winding(out_path, in_path)
+            result = repair_counter_winding(out_path)
         except Exception as e:
             self._log(f"Phase 8c issue: {e}", 'sub')
             return
@@ -1943,7 +1933,7 @@ class FringeKiller:
             self.phase_flatten(in_path, out_path)
             # Phase 8c: repair counters that FontForge's correctDirection
             # flipped (it can mistake a thickened 'e' bowl for a solid shape)
-            self.phase_repair_winding(in_path, out_path)
+            self.phase_repair_winding(out_path)
             # Phase 9 (fontTools post-processing)
             self.phase_postprocess(out_path)
             # Validate
