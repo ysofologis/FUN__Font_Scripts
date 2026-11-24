@@ -545,6 +545,37 @@ containment — not by position, because `changeWeight()` and
 `removeOverlap()` may merge, split or reorder contours — and exits non-zero
 on any flipped relationship.
 
+#### The overlap-expressed counter
+
+A shape can express its counter by **overlap** rather than by a hole: the
+outer contour's path runs around the *inside* of the counter, and a second
+contour closes it from the other side. The two contours overlap, so the
+"counter" winds the **same** way as the shape around it.
+
+Sofia Sans' `A` is exactly that:
+
+| | outer area | counter area |
+|---|---|---|
+| source | -108025 | **-21719** (same sign — an overlap region) |
+| after `changeWeight` + `removeOverlap` | +176311 | **-42224** (opposite — a real hole) |
+
+`changeWeight()` and `removeOverlap()` resolve the overlap into a real
+hole, and that renders correctly.
+
+So the winding must **not** be compared against the source. The only
+condition worth repairing is decidable from the output alone: a counter
+that winds the **same** way as the shape enclosing it is not a hole — under
+the nonzero fill rule the two cancel and it fills in. A counter that
+already winds opposite is a hole and is left alone.
+
+An earlier version compared against the source and reversed any counter
+whose relationship differed. On the `A` that "corrected" a perfectly good
+output: the counter went from -42224 to +42224 and the glyph's ink from
+**135533 to 177306** — the upper triangle filled in solid.
+
+The same trap applies to the **guard**: a source-relative guard reports
+the *correct* output as failing and the *broken* one as passing.
+
 **Known unrelated failure:** at `--thickness 5`, v5 hangs indefinitely on
 `NeverMindCompact-Thin` — 23 `Internal Error: Unexpected point count in
 SSAddPoints`, zero output files, log frozen while the process keeps

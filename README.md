@@ -636,6 +636,33 @@ containment — not by position, because `changeWeight()` and
 on any flipped relationship. Measured on Corporate S Pro Demi: **16**
 flipped glyphs before the fix, **0** after.
 
+#### The overlap-expressed counter
+
+A shape can express its counter by **overlap** rather than by a hole: the
+outer contour's path runs around the *inside* of the counter, and a second
+contour closes it from the other side. The two overlap, so the "counter"
+winds the **same** way as the shape around it.
+
+Sofia Sans' `A` is exactly that. In the source, the outer contour has area
+-108025 and the counter -21719 — the same sign, because the counter is an
+overlap region and not a hole. `changeWeight()` plus `removeOverlap()`
+resolve that overlap into a real hole (counter -42224, opposite the outer),
+which renders correctly.
+
+So the winding must **not** be compared against the source. The only
+condition worth repairing is decidable from the output alone: a counter
+that winds the **same** way as the shape enclosing it is not a hole — under
+the nonzero fill rule the two cancel and it fills in. A counter that
+already winds opposite is a hole and is left alone.
+
+An earlier version compared against the source and reversed any counter
+whose relationship differed. On the `A` that "corrected" a perfectly good
+output: the counter went from -42224 to +42224 and the glyph's ink from
+**135533 to 177306** — the upper triangle filled in solid.
+
+The same trap applies to the **guard**: a source-relative guard reports the
+*correct* output as failing and the *broken* one as passing.
+
 
 #### `improve_font_rendering.py` (fonttools-based)
 
