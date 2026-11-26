@@ -665,6 +665,49 @@ The same trap applies to the **guard**: a source-relative guard reports the
 *correct* output as failing and the *broken* one as passing.
 
 
+#### The control point on a collapsed segment
+
+A control point sits between two on-curve points. It may be far from them —
+that is what makes it a curve — but the segment it controls is then long too.
+
+FontForge 20251009's `changeWeight()` and `simplify()` can leave a control
+point hundreds of units away while the two on-curve points either side of it
+sit a unit apart: the segment has collapsed and the control was left behind,
+dragging the curve out of the glyph. Amazon Ember's `uni0306.cyrl.cap` comes
+out **664 units tall** instead of 157, with a control point at y=437 in a
+glyph that spans y=776..937.
+
+The corruption **moves between glyphs**, which makes it look unreproducible:
+`changeWeight()` breaks `uni0306.cap` (133 → 738) and `_glyph_pass`'s
+`simplify()` then *repairs* it (738 → 135), while `simplify()` breaks
+`uni0306.cyrl.cap` (159 → 664). Whichever glyph `glyph_pass` does not touch
+stays broken.
+
+Five of `_glyph_pass`'s sub-phases trigger it — `_phase_smooth`,
+`_phase_cleanup`, `_phase_collinear`, `_phase_stem_normalise` and
+`_phase_flatten_curves` — all of which call `simplify()`.
+
+**Detected by the two conditions together:** the control is far from its
+neighbours (more than 100 units) AND the segment it controls has collapsed
+(under 5 units).
+
+Neither alone is enough. The absolute distance alone matches perfectly
+ordinary controls on a big glyph — Corporate S Pro's `Ccommaaccent` has
+controls 2075 units from their neighbours. The ratio alone is also not
+enough: legitimate ratios reach 74.9 in PFBeauSansPro's `ozonefriendly`,
+well past any threshold that would catch the strays.
+
+Measured over **1,647,279** control points in five families, the two
+conditions together match nothing at all. The strays FontForge leaves
+measure 313–352 units against a segment of 1.4 units.
+
+**Guard it:**
+
+```bash
+python3 check_stray_controls.py Output.otf
+```
+
+
 #### `improve_font_rendering.py` (fonttools-based)
 
 Light touch-ups: coordinate rounding, contour simplification, direction correction, outline validation, vertical metrics fix.
