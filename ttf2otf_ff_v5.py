@@ -425,6 +425,242 @@ def _fl_pair_counters(contours, areas):
     return pairs or None
 
 
+def _fl_point_sequence(ops):
+    """Rebuild a contour's (point, on_curve) sequence from a pen recording."""
+    seq = []
+    for op, args in ops:
+        if op == 'moveTo':
+            seq.append((args[0], True))
+        elif op == 'lineTo':
+            seq.append((args[0], True))
+        elif op == 'curveTo':
+            seq.append((args[0], False))
+            seq.append((args[1], False))
+            seq.append((args[2], True))
+        elif op == 'qCurveTo':
+            for q in args:
+                if q is not None:
+                    seq.append((q, False))
+    return seq
+
+
+def _fl_stray_controls(ops, min_distance=100.0, max_segment=5.0):
+    """Indices of control points that belong to a collapsed segment.
+
+    A control point sits between two on-curve points. It may be far from
+    them -- that is what makes it a curve -- but the segment it controls
+    is then long too. FontForge's changeWeight() and simplify() can leave
+    a control point hundreds of units away while the two on-curve points
+    either side of it sit a unit apart: the segment has collapsed and the
+    control was left behind, dragging the curve out of the glyph.
+
+    So the signature is BOTH conditions together:
+
+      * the control is far from its neighbours (more than 100 units)
+      * the segment it controls has collapsed (under 5 units)
+
+    Neither alone is enough. The absolute distance alone matches
+    perfectly ordinary controls on a big glyph: Corporate S Pro's
+    'Ccommaaccent' has controls 2075 units from their neighbours. The
+    ratio alone is also not enough -- legitimate ratios reach 74.9 in
+    PFBeauSansPro's 'ozonefriendly'.
+
+    Measured over 1,647,279 control points in five families (Amazon
+    Ember, Sofia Sans, Corporate S Pro, PFBeauSansPro, Absolut Pro), the
+    two conditions together match nothing at all. The strays FontForge
+    leaves measure 313-352 units against a segment of 1.4 units.
+
+    Returns a list of indices.
+    """
+    seq = _fl_point_sequence(ops)
+    n = len(seq)
+    out = []
+    for i, (pt, on) in enumerate(seq):
+        if on:
+            continue
+        prev = None
+        nxt = None
+        for j in range(i - 1, -1, -1):
+            if seq[j][1]:
+                prev = seq[j][0]
+                break
+        for j in range(i + 1, n):
+            if seq[j][1]:
+                nxt = seq[j][0]
+                break
+        if prev is None or nxt is None:
+            continue
+        d = max(math.hypot(prev[0] - pt[0], prev[1] - pt[1]),
+                math.hypot(nxt[0] - pt[0], nxt[1] - pt[1]))
+        seg = math.hypot(prev[0] - nxt[0], prev[1] - nxt[1])
+        if d > min_distance and seg < max_segment:
+            out.append(i)
+    return out
+
+
+def _fl_rebuild_contour(seq, drop_indices):
+    """Emit a contour from a (point, on_curve) sequence, minus some points.
+
+    A dropped control point is simply left out: the two on-curve
+    neighbours then form the edge, which is what the source had.
+    """
+    kept = [(pt, on) for i, (pt, on) in enumerate(seq)
+            if i not in drop_indices]
+    if not kept:
+        return []
+    ops = [('moveTo', (kept[0][0],))]
+    pending = []
+    for pt, on in kept[1:]:
+        if on:
+            if pending:
+                ops.append(('qCurveTo', tuple(pending) + (pt,)))
+                pending = []
+            else:
+                ops.append(('lineTo', (pt,)))
+        else:
+            pending.append(pt)
+    if pending:
+        ops.append(('qCurveTo', tuple(pending) + (kept[0][0],)))
+    ops.append(('closePath', ()))
+    return ops
+
+
+def repair_stray_controls(out_path, min_distance=100.0, max_segment=5.0):
+    """Remove the control points FontForge leaves on collapsed segments.
+
+    Why this is needed
+    ------------------
+    FontForge 20251009's changeWeight() and simplify() can leave a
+    control point far outside the glyph while the two on-curve points it
+    sits between are a unit apart. The control then drags the curve out
+    of the shape: the combining circumflex 'uni0306.cyrl.cap' in Amazon
+    Ember comes out 664 units tall instead of 157, with a control point
+    at y=437 in a glyph that spans y=776..937.
+
+    It is silent. The glyph's contour count, its point count and its
+    advance width are all unchanged, and the shape still renders -- it is
+    just stretched out of true.
+
+    How it is detected
+    ------------------
+    By the two conditions together: the control is far from its
+    neighbours AND the segment it controls has collapsed. See
+    _fl_stray_controls() for why neither alone is enough.
+
+    Why it runs here and not in FontForge
+    -------------------------------------
+    The FontForge Python layer cannot express the edit. On 20251009,
+    contour[i].x reads back correctly from the same reference but reverts
+    on a fresh read, and contour.removePoint does not exist -- so a
+    repair written there would claim work it cannot perform.
+
+    Returns (glyphs_repaired, controls_removed) or None.
+    """
+    if not FLATTEN_TOOLS:
+        return None
+    from fontTools.pens.recordingPen import RecordingPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib import TTFont as _FT
+
+    try:
+        font = _FT(out_path)
+    except Exception:
+        return None
+
+    is_cff = ('CFF ' in font) or ('CFF2' in font)
+    if not is_cff and 'glyf' not in font:
+        try:
+            font.close()
+        except Exception:
+            pass
+        return None
+
+    key = 'CFF ' if 'CFF ' in font else ('CFF2' if 'CFF2' in font else None)
+    glyph_set = font.getGlyphSet()
+
+    if is_cff:
+        top = font[key].cff.topDictIndex[0]
+        char_strings = top.CharStrings
+        private = getattr(top, 'Private', None)
+        global_subrs = getattr(top, 'GlobalSubrs', None)
+
+    repaired = 0
+    removed = 0
+
+    for name in font.getGlyphOrder():
+        rec = RecordingPen()
+        try:
+            glyph_set[name].draw(rec)
+        except Exception:
+            continue
+        contours = _fl_split_contours(rec.value)
+        if not contours:
+            continue
+
+        changed = False
+        plans = []
+        total_drop = 0
+        for cop in contours:
+            strays = _fl_stray_controls(cop, min_distance, max_segment)
+            if not strays:
+                plans.append(None)
+                continue
+            seq = _fl_point_sequence(cop)
+            drop = set(strays)
+            total_drop += len(drop)
+            plans.append((seq, drop))
+            changed = True
+
+        if not changed:
+            continue
+
+        try:
+            if is_cff:
+                width = font['hmtx'][name][0] if 'hmtx' in font else None
+                pen = T2CharStringPen(width, glyph_set, roundTolerance=0)
+                for cop, plan in zip(contours, plans):
+                    if plan is None:
+                        for op, args in cop:
+                            getattr(pen, op)(*args)
+                    else:
+                        seq, drop = plan
+                        for op, args in _fl_rebuild_contour(seq, drop):
+                            getattr(pen, op)(*args)
+                char_strings[name].program = pen.getCharString(
+                    private=private,
+                    globalSubrs=global_subrs).program
+            else:
+                pen = TTGlyphPen(None)
+                for cop, plan in zip(contours, plans):
+                    if plan is None:
+                        for op, args in cop:
+                            getattr(pen, op)(*args)
+                    else:
+                        seq, drop = plan
+                        for op, args in _fl_rebuild_contour(seq, drop):
+                            getattr(pen, op)(*args)
+                font['glyf'][name] = pen.glyph()
+            repaired += 1
+            removed += total_drop
+        except Exception:
+            continue
+
+    saved = False
+    try:
+        font.save(out_path)
+        saved = True
+    except Exception:
+        saved = False
+    try:
+        font.close()
+    except Exception:
+        pass
+    if not saved:
+        return None
+    return (repaired, removed)
+
+
 def repair_counter_winding(out_path):
     """Make every counter wind opposite to the shape that encloses it.
 
@@ -1852,6 +2088,36 @@ class FringeKiller:
             self._log(f"Phase 8b: straightened {flattened} near-straight "
                       f"curves back onto their chords ({kept} kept)", 'sub')
 
+    def phase_repair_stray_controls(self, out_path):
+        """Phase 8d: remove control points left on collapsed segments.
+
+        FontForge's changeWeight() and simplify() can leave a control
+        point far outside the glyph while the on-curve points either side
+        of it are a unit apart. The control then drags the curve out of
+        the shape. See repair_stray_controls() for the full account.
+        """
+        if not FLATTEN_TOOLS:
+            if self.verbose:
+                self._log("Phase 8d: stray control repair skipped (fontTools "
+                          "unavailable)", 'sub')
+            return
+        try:
+            result = repair_stray_controls(out_path)
+        except Exception as e:
+            self._log(f"Phase 8d issue: {e}", 'sub')
+            return
+        if result is None:
+            if self.verbose:
+                self._log("Phase 8d: stray control repair skipped (unreadable)",
+                          'sub')
+            return
+        repaired, removed = result
+        self.stats['stray_glyphs_repaired'] = repaired
+        self.stats['stray_controls_removed'] = removed
+        if repaired:
+            self._log(f"Phase 8d: removed {removed} stray control point(s) "
+                      f"from {repaired} glyph(s)", 'sub')
+
     def phase_repair_winding(self, out_path):
         """Phase 8c: restore counter winding that FontForge flipped.
 
@@ -1934,6 +2200,9 @@ class FringeKiller:
             # Phase 8c: repair counters that FontForge's correctDirection
             # flipped (it can mistake a thickened 'e' bowl for a solid shape)
             self.phase_repair_winding(out_path)
+            # Phase 8d: remove control points FontForge left on collapsed
+            # segments (they drag the curve out of the glyph)
+            self.phase_repair_stray_controls(out_path)
             # Phase 9 (fontTools post-processing)
             self.phase_postprocess(out_path)
             # Validate
